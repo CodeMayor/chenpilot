@@ -2,7 +2,7 @@
 Chen Pilot is a sophisticated AI-driven gateway that enables seamless interaction with blockchain networks and DeFi protocols through natural language. It provides a unified, professional interface for managing Bitcoin assets, Stellar operations, cross-chain liquidity swaps, and lending protocols.
 
 ---
-
+///WIP
 ## Prerequisites
 
 - **Node.js 18+** — required by TypeScript 5.7+, ESLint 9.x
