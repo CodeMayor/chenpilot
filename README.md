@@ -1,6 +1,6 @@
 # Chen Pilot — Autonomous AI Agent for Multi-Chain DeFi
 Chen Pilot is a sophisticated AI-driven gateway that enables seamless interaction with blockchain networks and DeFi protocols through natural language. It provides a unified, professional interface for managing Bitcoin assets, Stellar operations, cross-chain liquidity swaps, and lending protocols.
-
+///WIP
 ---
 
 ## Prerequisites
