@@ -569,6 +569,23 @@ describe("RetentionEngine", () => {
     expect(() => engine.stop()).not.toThrow();
   });
 
+  it("runs the scheduled pass on only one of several instances per day (#1067)", async () => {
+    const { InMemoryTaskLeaseStore } = await import("../../Reliability/scheduledTaskLease");
+    const store = new InMemoryTaskLeaseStore();
+    const engines = [0, 1, 2].map(
+      () => new RetentionEngine(mockDs as unknown as import("typeorm").DataSource)
+    );
+    const spies = engines.map((e) => jest.spyOn(e, "runRetentionPass"));
+    const day = new Date("2026-11-23T02:00:00Z");
+
+    await Promise.all(engines.map((e) => e.runScheduledRetentionPass(day, store)));
+    expect(spies.reduce((n, s) => n + s.mock.calls.length, 0)).toBe(1);
+
+    // Next day is a new occurrence.
+    await engines[1].runScheduledRetentionPass(new Date("2026-11-24T02:00:00Z"), store);
+    expect(spies[1].mock.calls.length + spies[0].mock.calls.length + spies[2].mock.calls.length).toBe(2);
+  });
+
   it("excludes expired workflow context during the retention pass", async () => {
     mockMemoryStore.purgeExpiredWorkflowContext.mockReturnValue(2);
     const result = await engine.runRetentionPass();
