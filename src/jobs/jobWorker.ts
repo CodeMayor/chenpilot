@@ -271,6 +271,7 @@ export class JobWorker {
         job.id,
         this.options.workerId,
         `No handler registered for ${job.jobType}`,
+        "no_handler",
       );
       logger.error("Job dead-lettered without handler", {
         jobId: job.id,
@@ -318,6 +319,7 @@ export class JobWorker {
           job.id,
           this.options.workerId,
           `Authorization denied: ${decision.reason} (decision ${decision.decisionId})`,
+          "authorization_denied",
         );
         logger.warn("Job dead-lettered by authorization policy", {
           jobId: job.id,
@@ -425,7 +427,7 @@ export class JobWorker {
       }
 
       if (error instanceof NonRetryableJobError) {
-        await this.queueService.deadLetterJob(job.id, this.options.workerId, message);
+        await this.queueService.deadLetterJob(job.id, this.options.workerId, message, "non_retryable");
         logger.error("Job failed permanently", {
           jobId: job.id,
           jobType: job.jobType,

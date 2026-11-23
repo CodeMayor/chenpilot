@@ -49,3 +49,41 @@ When a handler throws or returns `{ outcome: "retry" }`:
 Exhausted jobs are listed for operators by `GET /admin/jobs/dead-letter`.
 New jobs default `maxAttempts` to their class budget; a lower per-job
 `maxAttempts` still wins.
+
+## Dead-letter workflow (#1068)
+
+A job that cannot complete ends in `status = 'dead_letter'` with:
+
+| Field | Meaning |
+|---|---|
+| `failureClass` | `attempts_exhausted`, `retry_budget_exhausted`, `non_retryable`, `authorization_denied`, `no_handler`, `handler_dead_letter` |
+| `attempts` | Attempts consumed, including the one that dead-lettered it |
+| `lastError` | Last error message |
+| `disposition` | `pending_review` → `replayed` or `discarded` |
+| `dispositionBy` / `dispositionAt` / `dispositionNote` | Operator who acted, when, and an optional note |
+| `replayedAsJobId` / `replayOfJobId` | Links between a dead job and its replay |
+
+Migration `1790200000000-AddDeadLetterWorkflow` adds these columns. It marks
+existing dead-lettered jobs `pending_review`.
+
+### Operator API (admin only)
+
+- `GET /admin/jobs/dead-letter?disposition=pending_review&limit=25`: list.
+- `POST /admin/jobs/dead-letter/:jobId/replay`: `201 { replayJobId }` creates a
+  new job. Repeating the call returns `200 { status: "already_replayed",
+  replayJobId }` and creates no new job. Returns `409` for discarded or
+  not-dead-lettered jobs and `404` for unknown ids.
+- `POST /admin/jobs/dead-letter/:jobId/discard` with body `{ "note": "..." }`:
+  closes the job without replay. Returns `409` unless it is pending review.
+
+### Replay guarantees
+
+- **Exactly one new attempt chain:** the dead row is locked in the replay
+  transaction, and a unique index on `replayOfJobId` backs this up. The new job
+  starts at `attempts = 0`, and earlier retry-budget and interruption markers
+  are dropped.
+- **No authorization bypass:** the replay keeps the original `userId` and
+  stored auth context. The worker re-authorizes it as that user under the
+  current policy before the handler runs. If the user is no longer allowed, it
+  is dead-lettered again with `failureClass = authorization_denied`. The
+  operator is recorded in `metadata.replay.requestedBy` only.

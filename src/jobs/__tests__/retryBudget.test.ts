@@ -133,7 +133,7 @@ describe("JobWorker retry budgets (#1066)", () => {
     });
     await settle(worker, queue);
 
-    expect(queue.deadLetterJob).toHaveBeenCalledWith("job-1", "w1", "invalid destination");
+    expect(queue.deadLetterJob).toHaveBeenCalledWith("job-1", "w1", "invalid destination", "non_retryable");
     expect(queue.failJob).not.toHaveBeenCalled();
   });
 
