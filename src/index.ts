@@ -16,6 +16,7 @@ import { JobWorker } from "./jobs/jobWorker";
 import { buildDefaultJobHandlers } from "./jobs/jobHandlers";
 import { jobQueueService } from "./jobs/jobQueue.service";
 import { verifySecretConfiguration } from "./Security/secrets";
+import { checkSchemaCompatibility, type SchemaSource } from "./services/schemaCompatibility";
 
 class Server {
   private server: http.Server;
@@ -65,6 +66,24 @@ class Server {
       await AppDataSource.initialize();
       console.log("DB connection established!");
       logger.info("Database connected successfully");
+
+      // Schema compatibility (#1064). Migrations are never run on boot; a
+      // mismatch is logged with the fix and keeps /ready failing (503).
+      const schema = await checkSchemaCompatibility(
+        AppDataSource as unknown as SchemaSource
+      );
+      if (schema.status === "COMPATIBLE") {
+        logger.info("Database schema compatible", { version: schema.requiredVersion });
+      } else {
+        logger.error("Database schema mismatch", {
+          status: schema.status,
+          requiredVersion: schema.requiredVersion,
+          appliedVersion: schema.appliedVersion,
+          pending: schema.pending,
+          unknown: schema.unknown,
+          action: schema.action,
+        });
+      }
 
       // Initialize model registry with certified models
       logger.info("Initializing model registry...");
