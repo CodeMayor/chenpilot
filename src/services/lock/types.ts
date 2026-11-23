@@ -10,6 +10,12 @@ export interface LockResult {
   lockValue?: string;
   ttl?: number;
   acquiredAt?: number;
+  /**
+   * Monotonically increasing per resource (#1070). Pass it with every write
+   * the lock protects; writes carrying an older token than the latest issued
+   * one are rejected.
+   */
+  fencingToken?: number;
   error?: string;
 }
 
