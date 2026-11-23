@@ -1,4 +1,5 @@
 export * from "./batchPayoutWorkflow.service";
+export * from "./mandateConfirmation";
 export * from "./money";
 export * from "./paymentRequest.service";
 export * from "./paymentTypes";

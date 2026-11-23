@@ -7,6 +7,11 @@ import {
   systemClock,
 } from "./paymentTypes";
 import { addAmount, compareAmount } from "./money";
+import {
+  buildConfirmationSummary,
+  MandateConfirmationError,
+  type MandateConfirmationSummary,
+} from "./mandateConfirmation";
 
 export type MandateStatus = "active" | "revoked";
 export type MandateRunStatus = "pending" | "processing" | "succeeded" | "failed" | "ambiguous" | "missed";
@@ -24,7 +29,15 @@ export interface PaymentMandate {
   missedRunBehavior: MissedRunBehavior;
   status: MandateStatus;
   revokedAt?: Date;
+  /** Terms hash of the summary the user confirmed (#1102); cleared by any change. */
+  confirmedTermsHash?: string;
+  confirmedBy?: string;
+  confirmedAt?: Date;
 }
+
+export type MandateChanges = Partial<
+  Pick<PaymentMandate, "requirement" | "intervalMs" | "nextRunAt" | "cumulativeLimit" | "missedRunBehavior">
+>;
 
 export interface PaymentMandateRun {
   id: string;
@@ -56,9 +69,48 @@ export class RecurringPaymentMandateService {
     return this.cloneMandate(created);
   }
 
-  approveMandate(id: string): PaymentMandate {
+  /** Summary to show the user before activation or re-activation (#1102). */
+  getConfirmationSummary(id: string): MandateConfirmationSummary {
+    return buildConfirmationSummary(this.requireMandate(id));
+  }
+
+  /**
+   * Activate (approve) a mandate for the exact summary the user saw (#1102).
+   * Rejected if any shown field changed since, or required fields are missing.
+   */
+  approveMandate(id: string, summaryHash: string, actor = "user"): PaymentMandate {
     const mandate = this.requireMandate(id);
+    const summary = buildConfirmationSummary(mandate);
+    if (summary.missingFields.length > 0) {
+      throw new MandateConfirmationError(
+        `Cannot activate mandate ${id}: missing or invalid ${summary.missingFields.join(", ")}`,
+        "missing_fields",
+        summary.missingFields
+      );
+    }
+    if (summaryHash !== summary.summaryHash) {
+      throw new MandateConfirmationError(
+        `Confirmation for mandate ${id} no longer matches its current terms; review the updated summary`,
+        "stale_summary"
+      );
+    }
     mandate.approved = true;
+    mandate.confirmedTermsHash = summary.termsHash;
+    mandate.confirmedBy = actor;
+    mandate.confirmedAt = this.clock.now();
+    return this.cloneMandate(mandate);
+  }
+
+  /** Change a mandate's terms; any prior confirmation is invalidated (#1102). */
+  updateMandate(id: string, changes: MandateChanges): PaymentMandate {
+    const mandate = this.requireMandate(id);
+    if (mandate.status === "revoked") throw new Error(`Mandate is revoked: ${id}`);
+    Object.assign(mandate, changes);
+    if (changes.requirement) mandate.requirement = { ...changes.requirement };
+    mandate.approved = false;
+    mandate.confirmedTermsHash = undefined;
+    mandate.confirmedBy = undefined;
+    mandate.confirmedAt = undefined;
     return this.cloneMandate(mandate);
   }
 
@@ -81,8 +133,17 @@ export class RecurringPaymentMandateService {
   async runMandateIfDue(id: string, now = this.clock.now()): Promise<PaymentMandateRun | undefined> {
     const mandate = this.requireMandate(id);
     if (mandate.status !== "active" || mandate.nextRunAt.getTime() > now.getTime()) return undefined;
-    if (mandate.approvalRequired && !mandate.approved) {
-      throw new Error(`Mandate requires approval: ${id}`);
+    if (mandate.approvalRequired) {
+      if (!mandate.approved) {
+        throw new MandateConfirmationError(`Mandate requires approval: ${id}`, "not_confirmed");
+      }
+      // Defence in depth: terms must still match what was confirmed.
+      if (buildConfirmationSummary(mandate).termsHash !== mandate.confirmedTermsHash) {
+        throw new MandateConfirmationError(
+          `Mandate ${id} terms changed after confirmation; re-confirmation required`,
+          "stale_summary"
+        );
+      }
     }
     if (this.locks.has(id)) return undefined;
 
@@ -165,7 +226,9 @@ export class RecurringPaymentMandateService {
     return {
       ...mandate,
       nextRunAt: new Date(mandate.nextRunAt),
+      requirement: { ...mandate.requirement, asset: { ...mandate.requirement.asset } },
       revokedAt: mandate.revokedAt ? new Date(mandate.revokedAt) : undefined,
+      confirmedAt: mandate.confirmedAt ? new Date(mandate.confirmedAt) : undefined,
     };
   }
 
