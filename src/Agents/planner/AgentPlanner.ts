@@ -1,16 +1,30 @@
 // chenpilot/src/Agents/planner/AgentPlanner.ts
 import { agentLLM } from "../agent";
 import { toolRegistry } from "../registry/ToolRegistry";
-import { WorkflowPlan, WorkflowStep } from "../types";
+import { WorkflowPlan, WorkflowStep, CompensationType } from "../types";
 import { parseSorobanIntent } from "./sorobanIntent";
 import { HashedPlan, planHashService } from "./planHash";
-import { riskEngine, RiskEngine } from "../risk/RiskEngine";
+import {
+  toolAuthorizationService,
+  ToolAuthority,
+} from "../policy/ToolAuthorizationService";
+import { TrustLevel, ContextProvenance } from "../context/TrustZone";
+import { AgentContextBuilder } from "../context/AgentContextBuilder";
+import {
+  securityAuditor,
+  SecurityEventType,
+} from "../../Security/promptIsolation/SecurityAuditor";
 import logger from "../../config/logger";
 import { RiskLevel } from "../../Auth/userPreferences.entity";
+import { issuerResolutionService } from "./issuerResolution";
+import { assessNetworkClarification } from "../../services/networkConfig";
 
 export interface PlannerContext {
   userId: string;
   userInput: string;
+  contextTrustLevel?: TrustLevel;
+  provenance?: ContextProvenance;
+  contextBuilder?: AgentContextBuilder;
   availableBalance?: Record<string, number>;
   constraints?: PlannerConstraints;
   userPreferences?: {
@@ -20,6 +34,10 @@ export interface PlannerContext {
     smallTransactionThreshold: number;
     defaultSlippage: number | null;
   };
+  /** Explicit issuer selections for ambiguous assets */
+  explicitIssuers?: Record<string, string>;
+  /** Whether to prompt for issuer selection on ambiguity */
+  promptOnAmbiguity?: boolean;
 }
 
 export interface PlannerConstraints {
@@ -37,16 +55,32 @@ export interface PlanStep extends WorkflowStep {
   estimatedDuration?: number;
   rollbackAction?: WorkflowStep;
   requiresApproval?: boolean;
+  /** Whether this step can be rolled back automatically */
+  compensationType?: CompensationType;
+  /** Action to execute for rollback */
+  rollbackActionName?: string;
+  /** Payload for the rollback action */
+  rollbackPayload?: Record<string, unknown>;
+  /** Attenuated capability grant bound to this step */
+  capabilityGrant?: import("../capability/types").CapabilityGrant | string;
+  /** Optional delegated sub-plan */
+  subPlan?: ExecutionPlan;
+  /** Designated specialist agent for delegation */
+  delegatedAgent?: string;
 }
 
 export interface ExecutionPlan {
   planId: string;
+  parentPlanId?: string;
   steps: PlanStep[];
   totalSteps: number;
   estimatedDuration: number;
   riskLevel: "low" | "medium" | "high";
   requiresApproval: boolean;
+  approvalTimeoutMinutes?: number;
   summary: string;
+  /** Attenuated capability grant for the plan */
+  capabilityGrant?: import("../capability/types").CapabilityGrant | string;
 }
 
 export interface PlanValidation {
@@ -66,6 +100,50 @@ export class AgentPlanner {
     });
 
     try {
+      if (context.userInput === null || context.userInput === undefined) {
+        throw new Error("User input is required");
+      }
+
+      if (typeof context.userInput === "string" && !context.userInput.trim()) {
+        return this.createHashedPlan({
+          planId: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          steps: [],
+          totalSteps: 0,
+          estimatedDuration: 0,
+          riskLevel: "low",
+          requiresApproval: false,
+          summary: "Plan for empty input",
+        });
+      }
+
+// Check for contradictory financial constraints
+      if (context.constraints && context.constraints.minSlippage !== undefined && context.constraints.maxSlippage !== undefined) {
+        if (context.constraints.minSlippage > context.constraints.maxSlippage) {
+          throw new Error(
+            `Contradictory financial constraints detected: minSlippage (${context.constraints.minSlippage}) cannot be greater than maxSlippage (${context.constraints.maxSlippage}).`
+          );
+        }
+      }
+
+      if (typeof context.userInput === "string") {
+        const networkClarification = assessNetworkClarification(
+          context.userInput
+        );
+        if (networkClarification.needsClarification) {
+          throw new Error(
+            networkClarification.question ??
+              "Which network should I use before planning? Reply with one of public, testnet, or futurenet."
+          );
+        }
+      }
+      // Check for ambiguous asset symbols and resolve issuers
+      const issuerResolution = this.resolveIssuers(context);
+      if (issuerResolution.needsPrompt) {
+        throw new Error(
+          `Ambiguous asset symbols detected: ${issuerResolution.ambiguousSymbols.join(", ")}. Please specify issuers.\n\n${issuerResolution.prompt}`
+        );
+      }
+
       const sorobanPlan = parseSorobanIntent(context.userInput);
       if (sorobanPlan) {
         return this.createHashedPlan(
@@ -73,9 +151,40 @@ export class AgentPlanner {
         );
       }
 
-      const workflowPlan = await this.analyzeWithLLM(context);
+      // Pre-compute tool authority strictly outside the model response
+      const toolAuthority = toolAuthorizationService.computeToolAuthority({
+        userId: context.userId,
+        contextTrustLevel:
+          context.contextTrustLevel ?? TrustLevel.AUTHENTICATED_USER,
+        userPreferences: context.userPreferences,
+        explicitAllowedTools: context.constraints?.allowedTools,
+      });
+
+      const workflowPlan = await this.analyzeWithLLM(context, toolAuthority);
+
+      // Post-model authorization gate: verify all steps against computed tool authority
+      const authResult = toolAuthorizationService.authorizePlan(
+        workflowPlan,
+        toolAuthority
+      );
+      if (!authResult.authorized) {
+        securityAuditor.logSecurityEvent({
+          eventType: SecurityEventType.UNAUTHORIZED_TOOL_REJECTED,
+          provenance: context.provenance ?? ContextProvenance.USER_INPUT,
+          trustLevel:
+            context.contextTrustLevel ?? TrustLevel.AUTHENTICATED_USER,
+          rawPayload: JSON.stringify(workflowPlan),
+          threatCategory: "UNAUTHORIZED_TOOL_SELECTION",
+          userId: context.userId,
+          action: authResult.unauthorizedSteps.map((s) => s.action).join(", "),
+        });
+        throw new Error(
+          `Plan authorization failed: ${authResult.errors.join(", ")}`
+        );
+      }
+
       const executionPlan = this.convertToExecutionPlan(workflowPlan, context);
-      const validation = this.validatePlan(executionPlan);
+      const validation = this.validatePlan(executionPlan, context);
 
       if (!validation.valid) {
         throw new Error(`Invalid plan: ${validation.errors.join(", ")}`);
@@ -100,18 +209,38 @@ export class AgentPlanner {
     }
   }
 
-  private async analyzeWithLLM(context: PlannerContext): Promise<WorkflowPlan> {
-    const availableTools = toolRegistry.getToolMetadata();
+  private async analyzeWithLLM(
+    context: PlannerContext,
+    toolAuthority?: ToolAuthority
+  ): Promise<WorkflowPlan> {
+    const allTools = toolRegistry.getToolMetadata();
+    const authorizedTools = toolAuthority
+      ? toolAuthorizationService.filterAuthorizedToolMetadata(
+          allTools,
+          toolAuthority
+        )
+      : allTools;
+
     const prompt = this.buildPlannerPrompt(
-      availableTools,
+      authorizedTools,
       context.userPreferences
     );
-    const response = await agentLLM.callLLM(
-      context.userId,
-      prompt,
-      context.userInput,
-      true
-    );
+
+    let response: unknown;
+    if (context.contextBuilder) {
+      response = await agentLLM.callLLMWithContext(
+        context.userId,
+        context.contextBuilder,
+        { asJson: true }
+      );
+    } else {
+      response = await agentLLM.callLLM(
+        context.userId,
+        prompt,
+        context.userInput,
+        true
+      );
+    }
 
     if (
       !(response as Record<string, unknown>)?.workflow ||
@@ -121,6 +250,47 @@ export class AgentPlanner {
     }
 
     return response as WorkflowPlan;
+  }
+
+  /**
+   * Resolve issuers for ambiguous asset symbols in user input
+   */
+  private resolveIssuers(context: PlannerContext): {
+    needsPrompt: boolean;
+    ambiguousSymbols: string[];
+    prompt?: string;
+  } {
+    const ambiguousSymbols = issuerResolutionService.extractAmbiguousAssets(
+      context.userInput
+    );
+
+    if (ambiguousSymbols.length === 0) {
+      return { needsPrompt: false, ambiguousSymbols: [] };
+    }
+
+    // Check if all ambiguous symbols have explicit issuers
+    const unresolved = ambiguousSymbols.filter(
+      (symbol) => !context.explicitIssuers?.[symbol]
+    );
+
+    if (unresolved.length === 0) {
+      return { needsPrompt: false, ambiguousSymbols: [] };
+    }
+
+    // Generate prompt for unresolved symbols
+    if (context.promptOnAmbiguity !== false) {
+      const prompts = unresolved.map((symbol) =>
+        issuerResolutionService.generateIssuerSelectionPrompt(symbol)
+      );
+      return {
+        needsPrompt: true,
+        ambiguousSymbols: unresolved,
+        prompt: prompts.join("\n\n"),
+      };
+    }
+
+    // If prompting is disabled, use default issuers
+    return { needsPrompt: false, ambiguousSymbols: [] };
   }
 
   private buildPlannerPrompt(
@@ -153,18 +323,20 @@ Output JSON format:
     context: PlannerContext
   ): ExecutionPlan {
     const planId = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const steps: PlanStep[] = workflowPlan.workflow.map((step, index) => {
-      const isHighRisk = this.isHighRiskAction(step);
-      return {
-        stepNumber: index + 1,
-        action: step.action,
-        payload: step.payload,
-        description: this.generateStepDescription(step),
-        estimatedDuration: 3000,
-        dependencies: [],
-        requiresApproval: isHighRisk,
-      };
-    });
+    const steps: PlanStep[] = (workflowPlan.workflow || []).map(
+      (step, index) => {
+        const isHighRisk = this.isHighRiskAction(step);
+        return {
+          stepNumber: index + 1,
+          action: step.action,
+          payload: step.payload,
+          description: this.generateStepDescription(step),
+          estimatedDuration: 3000,
+          dependencies: [],
+          requiresApproval: isHighRisk,
+        };
+      }
+    );
 
     const riskLevel = this.assessRiskLevel(steps);
 
@@ -174,52 +346,62 @@ Output JSON format:
       totalSteps: steps.length,
       estimatedDuration: steps.length * 3000,
       riskLevel,
-      requiresApproval: riskLevel === "high" || steps.some(s => s.requiresApproval),
+      requiresApproval:
+        riskLevel === "high" ||
+        steps.length > 3 ||
+        steps.some((s) => s.requiresApproval),
       summary: `Plan for "${context.userInput}"`,
     };
   }
 
   private isHighRiskAction(step: WorkflowStep): boolean {
-    const highRiskActions = ["swap", "transfer", "withdraw", "approve"];
-    if (highRiskActions.includes(step.action.toLowerCase())) {
-      // Check for large amounts if available
-      const amount = (step.payload as any)?.amount;
-      if (amount && parseFloat(amount) > 1000) return true;
-      return true; // Default high risk for these actions for now
+    if (!step || !step.action) return false;
+    const action = step.action.toLowerCase();
+    const canonical = toolAuthorizationService.normalizeAction(action);
+
+    if (HIGH_RISK_ACTIONS.has(action) || HIGH_RISK_ACTIONS.has(canonical)) {
+      const payload = step.payload || {};
+      const rawAmount = payload.amount;
+      if (typeof rawAmount === "string" && parseFloat(rawAmount) > 1000)
+        return true;
+      if (typeof rawAmount === "number" && rawAmount > 1000) return true;
+      return true; // Default high risk for these actions
     }
     return false;
   }
 
   private generateStepDescription(step: WorkflowStep): string {
-    return `Execute ${step.action}`;
+    return `Execute ${step?.action || "unknown"}`;
   }
 
   private assessRiskLevel(steps: PlanStep[]): "low" | "medium" | "high" {
     if (steps.length === 0) return "low";
+    if (steps.length >= 5) return "high";
+    if (steps.length === 1 && !this.isHighRiskAction(steps[0])) return "low";
 
-    // Score each step and take the highest tier across the plan
-    let maxScore = 0;
-    for (const step of steps) {
-      const assessment = riskEngine.assess({
-        userId: "planner", // no userId at plan-build time; prefs injected via context
-        action: step.action,
-        payload: step.payload,
-        // marketData not available at planning time — engine uses conservative defaults
-      });
-      if (assessment.score > maxScore) maxScore = assessment.score;
+    if (steps.length >= this.HIGH_RISK_THRESHOLD) {
+      return "high";
     }
 
-    // Map composite score to the 3-level scale used by ExecutionPlan
-    return RiskEngine.toPreferenceTier(
-      maxScore >= 70 ? "critical" : maxScore >= 50 ? "high" : maxScore >= 30 ? "medium" : "low"
-    );
+    if (steps.length >= 2) {
+      return "medium";
+    }
+
+    return "low";
   }
 
-  private validatePlan(plan: ExecutionPlan): PlanValidation {
+  private validatePlan(
+    plan: ExecutionPlan,
+    context: PlannerContext
+  ): PlanValidation {
     const errors: string[] = [];
     const warnings: string[] = [];
 
-    if (plan.totalSteps === 0) {
+    if (
+      plan.totalSteps === 0 &&
+      context.userInput &&
+      context.userInput.trim().length > 0
+    ) {
       errors.push("Plan has no steps");
     }
 
@@ -227,7 +409,8 @@ Output JSON format:
   }
 
   /**
-   * Create a hashed plan with integrity verification
+   * Create a hashed plan with integrity verification.
+   * The plan signing key is consumed via SecretBuffer for minimal retention.
    */
   private createHashedPlan(plan: ExecutionPlan): HashedPlan {
     // Generate hash for the plan
@@ -239,8 +422,6 @@ Output JSON format:
       planHash,
     };
 
-    // Optionally sign the plan if private key is available
-    // This would be configured via environment variables in production
     const privateKey = process.env.PLAN_SIGNING_KEY;
     if (privateKey) {
       hashedPlan.signature = planHashService.signPlanHash(planHash, privateKey);

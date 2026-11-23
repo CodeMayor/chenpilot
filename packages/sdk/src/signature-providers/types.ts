@@ -1,4 +1,8 @@
 import { ChainId } from "../types";
+import { ProviderType, ProviderConfig } from "./provider-factory";
+
+// Re-exported (canonical definitions live in ./provider-factory)
+export { ProviderType, ProviderConfig };
 
 // Base transaction types for different chains
 export interface BitcoinTransaction {
@@ -98,13 +102,6 @@ export interface SignatureProviderMetadata {
   website?: string;
 }
 
-// Provider types enum
-export enum ProviderType {
-  MOCK = "mock",
-  LEDGER = "ledger",
-  ALBEDO = "albedo",
-}
-
 // SDK Configuration
 export interface SignatureProviderSDKConfig {
   defaultProviders?: ProviderType[];
@@ -113,13 +110,52 @@ export interface SignatureProviderSDKConfig {
   enableLogging?: boolean;
   connectionTimeout?: number;
   maxRetries?: number;
-  registry?: Record<string, unknown>; // SignatureProviderRegistry type
+  errorRecovery?: {
+    enabled: boolean;
+    maxRetries: number;
+    retryDelay: number;
+  };
+  registry?: {
+    autoRegister?: boolean;
+    validateProviders?: boolean;
+    [key: string]: unknown;
+  };
 }
 
-// Provider configuration for factory
-export interface ProviderConfig {
-  type: ProviderType;
-  config?: Record<string, unknown>;
+export interface SignatureProviderContext {
+  registry: unknown;
+  factory: unknown;
+  coordinator: unknown;
+  errorRecovery: unknown;
+}
+
+export interface ProviderHealthCheck {
+  providerId: string;
+  healthy: boolean;
+  connected: boolean;
+  lastChecked: Date;
+  capabilities: SignatureProviderCapabilities;
+  errors?: Error[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface BatchOperationResult<T> {
+  successful: T[];
+  failed: Array<{ error: Error; input?: unknown }>;
+  totalCount: number;
+  successCount: number;
+  failureCount: number;
+  duration: number;
+}
+
+export interface ProviderMetrics {
+  providerId: string;
+  connectionCount: number;
+  signatureCount: number;
+  errorCount: number;
+  averageSigningTime: number;
+  lastActivity: Date;
+  uptime: number;
 }
 
 export interface ProviderSelectionPreferences {

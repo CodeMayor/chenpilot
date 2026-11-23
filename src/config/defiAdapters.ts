@@ -20,6 +20,13 @@ export interface AdapterCapabilities {
   lending: boolean;
   borrowing: boolean;
   farming: boolean;
+  /**
+   * Whether this adapter handles assets that take a fee on every transfer
+   * (fee-on-transfer / FOT tokens). Stellar path payments resolve output
+   * amounts via Horizon simulation so no extra FOT accounting is needed;
+   * both current adapters explicitly declare this false.
+   */
+  transferFeeAsset: boolean;
 }
 
 /**
@@ -54,6 +61,17 @@ export interface DeFiAdapterConfig {
     maxAttempts: number;
     backoffMs: number;
   };
+  /**
+   * Default-deny egress manifest. Adapters may only reach the hosts below
+   * over the listed protocols; the egress layer additionally blocks
+   * loopback/link-local/private/metadata/IPv6-mapped addresses and
+   * re-validates every redirect and every resolved IP.
+   */
+  egress?: {
+    allowedHosts: string[];
+    allowedProtocols: string[];
+    maxConcurrentRequests?: number;
+  };
 }
 
 /**
@@ -66,6 +84,7 @@ export const DEFAULT_CAPABILITIES: AdapterCapabilities = {
   lending: false,
   borrowing: false,
   farming: false,
+  transferFeeAsset: false,
 };
 
 /**
@@ -145,6 +164,10 @@ function createAdapterConfig(
         process.env[`${prefix}_CAPABILITY_FARMING`],
         defaults.capabilities?.farming ?? false
       ),
+      transferFeeAsset: parseBool(
+        process.env[`${prefix}_CAPABILITY_TRANSFER_FEE_ASSET`],
+        defaults.capabilities?.transferFeeAsset ?? false
+      ),
     },
     customConfig: defaults.customConfig,
     timeout: parseNumber(
@@ -161,6 +184,7 @@ function createAdapterConfig(
         defaults.retry?.backoffMs ?? 1000
       ),
     },
+    egress: defaults.egress,
   };
 }
 
@@ -191,11 +215,17 @@ const DEFAULT_ADAPTERS: Record<DeFiProtocol, Partial<DeFiAdapterConfig>> = {
       lending: false,
       borrowing: false,
       farming: false,
+      transferFeeAsset: false,
     },
     timeout: 30000,
     retry: {
       maxAttempts: 3,
       backoffMs: 1000,
+    },
+    egress: {
+      allowedHosts: ["api.equilibre.io"],
+      allowedProtocols: ["https:"],
+      maxConcurrentRequests: 4,
     },
   },
   yieldblox: {
@@ -221,11 +251,17 @@ const DEFAULT_ADAPTERS: Record<DeFiProtocol, Partial<DeFiAdapterConfig>> = {
       lending: true,
       borrowing: true,
       farming: false,
+      transferFeeAsset: false,
     },
     timeout: 30000,
     retry: {
       maxAttempts: 3,
       backoffMs: 1000,
+    },
+    egress: {
+      allowedHosts: ["api.yieldblox.io"],
+      allowedProtocols: ["https:"],
+      maxConcurrentRequests: 4,
     },
   },
 };

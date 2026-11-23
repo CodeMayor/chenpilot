@@ -1,9 +1,5 @@
 export type ParameterType =
-  | "string"
-  | "number"
-  | "boolean"
-  | "object"
-  | "array";
+  "string" | "number" | "boolean" | "object" | "array";
 
 export interface ParameterDefinition {
   type: ParameterType;
@@ -16,6 +12,26 @@ export interface ParameterDefinition {
 }
 
 export type ToolRiskLevel = "low" | "medium" | "high";
+
+/**
+ * Default-deny egress manifest for a tool. When present, every outbound
+ * request the tool makes is routed through the egress layer, which enforces
+ * this allowlist plus loopback/link-local/private/metadata/IPv6 address
+ * denial, DNS-rebinding defence-in-depth, and redirect re-validation.
+ */
+export interface ToolEgressConfig {
+  /** Permitted hosts; supports exact, `*.suffix`, and `*` (all public FQDNs). */
+  allowedHosts: string[];
+  /** Permitted URL schemes, e.g. ["https", "http"]. */
+  allowedProtocols: string[];
+  /** Maximum concurrent outbound requests. */
+  maxConcurrentRequests?: number;
+  /** Request budget (time + redirect depth). */
+  budget?: {
+    timeLimitMs?: number;
+    maxRedirects?: number;
+  };
+}
 
 export interface ToolMetadata {
   name: string;
@@ -32,6 +48,8 @@ export interface ToolMetadata {
   riskLevel: ToolRiskLevel;
   capabilities: string[];
   author?: string;
+  /** Declares permitted outbound destinations enforced by the egress layer. */
+  egress?: ToolEgressConfig;
 }
 
 export interface ToolDefinition<T = Record<string, unknown>> {
@@ -67,5 +85,5 @@ export interface ToolRegistryEntry {
   enabled: boolean;
   registeredAt: Date;
   lastUsed?: Date;
-  governanceMetadata?: Record<string, any>;
+  governanceMetadata?: Record<string, unknown>;
 }

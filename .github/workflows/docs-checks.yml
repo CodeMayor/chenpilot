@@ -1,0 +1,44 @@
+name: Docs Checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  docs-checks:
+    name: Repository docs hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The checkers and their tests use only Node built-ins, so no install step.
+      - name: Test the docs, environment, and migration checkers
+        run: node --test tests/docs/*.test.mjs tests/env/*.test.mjs tests/migrations/*.test.mjs
+
+      - name: No terminal snapshots in the repository root
+        run: node scripts/docs/check-root-artifacts.mjs
+
+      - name: Local Markdown links resolve
+        run: node scripts/docs/check-markdown-links.mjs
+
+      - name: INDEX.md has no duplicate sections, duplicate links, or stale paths
+        run: node scripts/docs/check-doc-index.mjs
+
+      - name: Archived reports follow the archival policy
+        run: node scripts/docs/check-archive.mjs
+
+      - name: Runbook steps link to commands or record manual evidence
+        run: node scripts/docs/check-runbooks.mjs
+
+      - name: Referenced environment variables are documented
+        run: node scripts/env/check-env-docs.mjs
+
+      - name: Migrations follow naming and transaction conventions
+        run: node scripts/migrations/check-migrations.mjs

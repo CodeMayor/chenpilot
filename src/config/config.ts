@@ -33,19 +33,26 @@ const STELLAR_NETWORKS: Record<
     horizonUrl: string;
     networkPassphrase: string;
     friendbotUrl: string;
+    /** Base reserve in XLM (0.5 XLM on both testnet and public). */
+    baseReserve: number;
   }
 > = {
   testnet: {
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
     friendbotUrl: "https://friendbot.stellar.org",
+    baseReserve: 0.5,
   },
   public: {
     horizonUrl: "https://horizon.stellar.org",
     networkPassphrase: "Public Global Stellar Network ; September 2015",
     friendbotUrl: "", // No friendbot on mainnet
+    baseReserve: 0.5,
   },
 };
+
+// Environment determination
+const nodeEnv = process.env.NODE_ENV || "development";
 
 // Validate JWT secret meets minimum security requirements
 const jwtSecret = process.env.JWT_SECRET || "secret-token";
@@ -55,10 +62,101 @@ if (jwtSecret.length < 32) {
   );
 }
 
-const encryptionKey = process.env.ENCRYPTION_KEY;
-if (!encryptionKey || !/^[0-9a-fA-F]{64}$/.test(encryptionKey)) {
+// Known placeholder/test credential values that must not be used in production
+const KNOWN_PLACEHOLDER_VALUES = new Set([
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "sk-test-placeholder",
+  "test-anthropic-key",
+  "mock-anthropic-key-for-test-suite",
+  "test-only-jwt-secret-0123456789abcdef",
+  "01234567890123456789012345678901",
+  "default_test_jwt_secret_32_chars_long_12345",
+  "secret-token",
+  "default-dev-signing-key",
+  "chenpilot-capability-secret-key-default-2026",
+]);
+
+// Reject known placeholder/test credentials in production
+if (nodeEnv === "production") {
+  const sensitiveEnvVars = [
+    "JWT_SECRET",
+    "ENCRYPTION_KEY",
+    "ANTHROPIC_API_KEY",
+    "SPONSOR_SECRET_KEY",
+    "CAPABILITY_SECRET_KEY",
+    "REVOCATION_SIGNING_KEY",
+  ];
+
+  for (const envVar of sensitiveEnvVars) {
+    const value = process.env[envVar];
+    if (value && KNOWN_PLACEHOLDER_VALUES.has(value)) {
+      throw new Error(
+        `Security violation: ${envVar} contains a known placeholder/test value. This must be replaced with a production secret before deployment.`
+      );
+    }
+  }
+}
+
+// Validate CORS configuration for production
+const allowedOrigins = process.env.ALLOWED_ORIGINS;
+
+if (nodeEnv === "production") {
+  if (!allowedOrigins) {
+    throw new Error(
+      "ALLOWED_ORIGINS must be set in production. Use a comma-separated list of allowed origins."
+    );
+  }
+
+  const origins = allowedOrigins.split(",").map((o) => o.trim());
+
+  // Reject wildcard in production
+  if (origins.includes("*")) {
+    throw new Error(
+      "ALLOWED_ORIGINS cannot contain wildcard (*) in production. Specify explicit origins."
+    );
+  }
+
+  // Validate each origin format
+  for (const origin of origins) {
+    if (!origin) {
+      throw new Error("ALLOWED_ORIGINS contains empty origin. Remove empty entries.");
+    }
+
+    try {
+      const url = new URL(origin);
+
+      // Only allow http/https schemes
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error(
+          `ALLOWED_ORIGINS contains invalid protocol '${url.protocol}'. Only http and https are allowed.`
+        );
+      }
+
+      // Ensure origin has a hostname
+      if (!url.hostname) {
+        throw new Error(
+          `ALLOWED_ORIGINS contains invalid origin '${origin}' with no hostname.`
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error) {
+        throw new Error(
+          `ALLOWED_ORIGINS contains malformed origin '${origin}': ${err.message}`
+        );
+      }
+      throw new Error(`ALLOWED_ORIGINS contains malformed origin '${origin}'.`);
+    }
+  }
+}
+
+const encryptionKey = process.env.ENCRYPTION_KEY?.trim();
+const encryptionKeysJson = process.env.ENCRYPTION_KEYS_JSON?.trim();
+if (
+  !encryptionKeysJson &&
+  (!encryptionKey || !/^[0-9a-fA-F]{64}$/.test(encryptionKey))
+) {
   throw new Error(
-    "ENCRYPTION_KEY must be set and be a 64-character hex string"
+    "ENCRYPTION_KEY must be a 64-character hex string when ENCRYPTION_KEYS_JSON is not set"
   );
 }
 
@@ -81,13 +179,16 @@ export default {
   port: parsePositiveInt("PORT", "2333"),
   apiKey: requireEnv("ANTHROPIC_API_KEY"),
   node_url: requireEnv("NODE_URL"),
-  encryptionKey: requireEnv("ENCRYPTION_KEY", 64),
+  encryptionKey,
   stellar: {
     network: stellarNetwork,
     horizonUrl: process.env.STELLAR_HORIZON_URL || stellarConfig.horizonUrl,
     networkPassphrase:
       process.env.STELLAR_NETWORK_PASSPHRASE || stellarConfig.networkPassphrase,
     friendbotUrl: stellarConfig.friendbotUrl,
+    baseReserve: Number.parseFloat(
+      process.env.STELLAR_BASE_RESERVE || String(stellarConfig.baseReserve)
+    ),
   },
   redis: {
     host: process.env.REDIS_HOST || "localhost",
@@ -127,16 +228,46 @@ export default {
     timeouts: {
       llmCall: parsePositiveInt("AGENT_LLM_TIMEOUT", "30000"),
       toolExecution: parsePositiveInt("AGENT_TOOL_TIMEOUT", "60000"),
-      agentExecution: parsePositiveInt(
-        "AGENT_EXECUTION_TIMEOUT",
-        "120000"
-      ),
+      agentExecution: parsePositiveInt("AGENT_EXECUTION_TIMEOUT", "120000"),
       planExecution: parsePositiveInt("AGENT_PLAN_TIMEOUT", "180000"),
     },
   },
   admin: {
     allowedIps: process.env.ADMIN_ALLOWED_IPS
-      ? process.env.ADMIN_ALLOWED_IPS.split(",").map((ip) => ip.trim()).filter(Boolean)
+      ? process.env.ADMIN_ALLOWED_IPS.split(",")
+          .map((ip) => ip.trim())
+          .filter(Boolean)
       : [],
+  },
+  externalRequest: {
+    defaultBudget: {
+      deadlineMs: parsePositiveInt("EXTERNAL_REQUEST_DEADLINE_MS", "10000"),
+      attempts: Number.parseInt(process.env.EXTERNAL_REQUEST_ATTEMPTS || "3", 10),
+      bytes: Number.parseInt(process.env.EXTERNAL_REQUEST_BYTES || "5242880", 10),
+      downstreamCalls: Number.parseInt(
+        process.env.EXTERNAL_REQUEST_DOWNSTREAM_CALLS || "10",
+        10
+      ),
+    },
+  },
+  inbound: {
+    jsonLimit: Number.parseInt(process.env.INBOUND_JSON_LIMIT_BYTES || "1048576", 10),
+    webhookLimit: Number.parseInt(process.env.INBOUND_WEBHOOK_LIMIT_BYTES || "1048576", 10),
+    attachmentLimit: Number.parseInt(process.env.INBOUND_ATTACHMENT_LIMIT_BYTES || "26214400", 10),
+  },
+  models: {
+    primary: process.env.MODEL_PRIMARY || "claude-3-5-haiku-20241022",
+    fallbacks: process.env.MODEL_FALLBACKS
+      ? process.env.MODEL_FALLBACKS.split(",").map((m) => m.trim()).filter(Boolean)
+      : ["claude-3-5-sonnet-20241022"],
+    selectionStrategy: (process.env.MODEL_SELECTION_STRATEGY || "quality_first") as
+      | "quality_first"
+      | "latency_first"
+      | "cost_first"
+      | "balanced",
+    verifyEquivalence: process.env.MODEL_VERIFY_EQUIVALENCE !== "false",
+    maxRetries: parsePositiveInt("MODEL_MAX_RETRIES", "2"),
+    differentialEvalOnStartup: process.env.MODEL_DIFFERENTIAL_EVAL_ON_STARTUP === "true",
+    minQualityScore: parseFloat(process.env.MODEL_MIN_QUALITY_SCORE || "0.7"),
   },
 };

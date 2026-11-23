@@ -76,6 +76,8 @@ export enum ExecutionAction {
   WALLET_DEPLOYED = "execution.wallet.deployed",
   CONTRACT_INVOKED = "execution.contract.invoked",
   CONTRACT_FAILED = "execution.contract.failed",
+  TRANSACTION_PREVIEW_GENERATED = "execution.transaction.preview_generated",
+  TRANSACTION_PREVIEW_REFUSED = "execution.transaction.preview_refused",
 }
 
 /** Policy category actions */
@@ -90,6 +92,13 @@ export enum PolicyAction {
   KYC_INITIATED = "policy.kyc.initiated",
   KYC_PASSED = "policy.kyc.passed",
   KYC_FAILED = "policy.kyc.failed",
+  AUTHORIZATION_DECISION = "policy.access.decision",
+  CHANNEL_MISMATCH = "policy.access.channel_mismatch",
+  ABUSE_ESCALATED = "policy.threat.abuse_escalated",
+  SECRET_ACCESSED = "policy.secret.accessed",
+  SECRET_ACCESS_DENIED = "policy.secret.access_denied",
+  SECRET_ROTATED = "policy.secret.rotated",
+  SECRET_REVOKED = "policy.secret.revoked",
 }
 
 /** Integration category actions */
@@ -103,13 +112,31 @@ export enum IntegrationAction {
   EXTERNAL_API_FAILED = "integration.external_api.failed",
 }
 
+/**
+ * Workload identity category actions
+ *
+ * These actions track the full lifecycle of internal service-to-service
+ * credential operations.  All events land in EventCategory.INTEGRATION.
+ */
+export enum WorkloadIdentityAction {
+  /** A new short-lived workload token was successfully issued */
+  WORKLOAD_TOKEN_ISSUED = "integration.workload.token_issued",
+  /** An inbound workload token passed all verification checks */
+  WORKLOAD_TOKEN_VERIFIED = "integration.workload.token_verified",
+  /** An inbound workload token was rejected (signature, expiry, audience, or env) */
+  WORKLOAD_TOKEN_REJECTED = "integration.workload.token_rejected",
+  /** A near-expired token was proactively rotated */
+  WORKLOAD_TOKEN_ROTATED = "integration.workload.token_rotated",
+}
+
 /** Union of all typed action enums */
 export type AuditEventAction =
   | AuthAction
   | AdminAction
   | ExecutionAction
   | PolicyAction
-  | IntegrationAction;
+  | IntegrationAction
+  | WorkloadIdentityAction;
 
 // ─── Core AuditEvent Interface ───────────────────────────────────────────────
 

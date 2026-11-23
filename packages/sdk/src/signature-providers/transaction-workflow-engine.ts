@@ -5,9 +5,15 @@ import { SignatureProviderRegistry } from "./registry";
 import { SignatureProviderFactory } from "./provider-factory";
 import { SignatureRequest } from "./types";
 import { SignatureProviderErrorUtils } from "./errors";
+import {
+  enforceDestinationMemoRequirements,
+  type StellarTransactionMemoShape,
+} from "../advancedOps/memoOperations";
+import { throwIfAborted } from "../abort";
+import type { AbortSignalLike } from "../types";
 
 export interface TransactionWorkflowSubmitter {
-  submit(chainId: ChainId, signedTransaction: unknown): Promise<{ success: boolean; transactionId?: string; rawResult?: unknown }>;
+  submit(chainId: ChainId, signedTransaction: unknown, signal?: AbortSignalLike): Promise<{ success: boolean; transactionId?: string; rawResult?: unknown }>;
 }
 
 export class TransactionWorkflowEngine {
@@ -17,7 +23,8 @@ export class TransactionWorkflowEngine {
     private readonly submitter?: TransactionWorkflowSubmitter
   ) {}
 
-  async execute(request: TransactionWorkflowRequest): Promise<TransactionWorkflowResult> {
+  async execute(request: TransactionWorkflowRequest, signal?: AbortSignalLike): Promise<TransactionWorkflowResult> {
+    throwIfAborted(signal);
     const provider = await this.selectProvider(request.chainId, request.providerPreferences);
     if (!provider.isConnected()) {
       await provider.connect();
@@ -29,10 +36,20 @@ export class TransactionWorkflowEngine {
       metadata: request.metadata,
     };
 
+    // Last gate before a signer sees the transaction: a destination that
+    // requires a memo must be satisfied while the transaction can still be
+    // rebuilt. Runs outside the provider try/catch so the failure names the
+    // destination requirement rather than blaming the selected provider.
+    if (request.chainId === ChainId.STELLAR) {
+      enforceDestinationMemoRequirements(
+        request.transaction as StellarTransactionMemoShape
+      );
+    }
+
     try {
-      const signature = await provider.signTransaction(signatureRequest);
+      const signature = await provider.signTransaction(signatureRequest, signal);
       const submitted = request.submit && this.submitter && signature.signedTransaction
-        ? await this.submitter.submit(request.chainId, signature.signedTransaction)
+        ? await this.submitter.submit(request.chainId, signature.signedTransaction, signal)
         : undefined;
 
       return { providerId: provider.providerId, chainId: request.chainId, signature, submitted, metadata: request.metadata };

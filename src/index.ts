@@ -9,6 +9,13 @@ import { horizonOperationStreamerService } from "./services/horizonOperationStre
 import { priceSpikeAlertService } from "./services/priceSpikeAlert.service";
 import { durableRecoveryService } from "./Agents/planner/DurableRecoveryService";
 import { idempotencyService } from "./Reliability/IdempotencyService";
+import { adminWorkflowService } from "./Agents/admin/workflow.service";
+import { identityVerificationService } from "./ContractIdentity/identityVerification.service";
+import { retentionEngine } from "./lifecycle/retentionEngine";
+import { JobWorker } from "./jobs/jobWorker";
+import { buildDefaultJobHandlers } from "./jobs/jobHandlers";
+import { jobQueueService } from "./jobs/jobQueue.service";
+import { verifySecretConfiguration } from "./Security/secrets";
 
 class Server {
   private server: http.Server;
@@ -22,7 +29,7 @@ class Server {
     initializeSocketManager(this.server);
     this.jobWorker = new JobWorker(jobQueueService, {
       workerId: `api-${process.pid}`,
-      queues: ["transactions", "side-effects"],
+      queues: ["transactions", "side-effects", "admin"],
       concurrency: 3,
       leaseMs: 30000,
       pollIntervalMs: 2500,
@@ -42,6 +49,7 @@ class Server {
         logger.info("Shutting down gracefully...");
         horizonOperationStreamerService.stop();
         priceSpikeAlertService.stop();
+        retentionEngine.stop();
         await this.jobWorker.stop();
         await AppDataSource.destroy();
         this.server.close(() => {
@@ -49,16 +57,39 @@ class Server {
           process.exit(0);
         });
       };
+      // Refuse to boot a shared environment with placeholder, revoked or
+      // mis-provisioned secrets.
+      await verifySecretConfiguration();
+
       console.log("Attempting to connect to DB...");
       await AppDataSource.initialize();
       console.log("DB connection established!");
       logger.info("Database connected successfully");
-      
+
+      // Initialize model registry with certified models
+      logger.info("Initializing model registry...");
+      initializeModelRegistry();
+      logger.info("Model registry initialized successfully");
+
+      // Initialize default admin workflow policies
+      await adminWorkflowService.initializeDefaultPolicies();
+
+      // Schedule initial workflow expiry cleanup job
+      await adminWorkflowService.scheduleExpiryCleanup(5);
+
       // Recover interrupted durable executions
       await durableRecoveryService.recoverInterruptedExecutions();
 
+      // Verify signed deployment manifests against chain state (Issue #676).
+      // This establishes contract identity before serving mutating traffic;
+      // any mismatch is enforced by the runtime identity gate.
+      await identityVerificationService.verifyAll();
+
       // Start unified idempotency background processor
       idempotencyService.startBackgroundProcessor();
+
+      // Start data retention scheduler (runs daily at 02:00 UTC)
+      retentionEngine.scheduleDaily(2);
 
       horizonOperationStreamerService.start();
       priceSpikeAlertService.start();

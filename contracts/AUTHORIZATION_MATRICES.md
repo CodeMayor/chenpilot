@@ -230,17 +230,25 @@ The circuit breaker operates automatically based on price violations:
 
 ### Function Authorization Matrix
 
-| Function | Caller Requirement | Auth Check | Description |
-|----------|------------------|------------|-------------|
-| `initialize` | Public (once) | None | Initialize vault |
-| `update_config` | Admin | `admin.require_auth()` | Update configuration |
-| `deposit` | Public | `caller.require_auth()` | Deposit collateral |
-| `withdraw` | Owner | `owner.require_auth()` | Withdraw collateral |
-| `borrow` | Public | `caller.require_auth()` + collateral check | Borrow against collateral |
-| `repay` | Public | `caller.require_auth()` | Repay debt |
-| `liquidate` | Public | `caller.require_auth()` + liquidation check | Liquidate position |
-| `get_position` | Public | None | Get user position |
-| `get_config` | Public | None | Get vault config |
+Privileged methods use `require_legacy_admin` (VaultAdmin / EmergencyAdmin / UpgradeAdmin via UnifiedAuth, currently the legacy admin). Pause blocks `set_backend_status` and `propose_upgrade`. Withdrawal remains available while paused.
+
+| Function | Required role | Pause behavior | Auth Check | Description |
+|----------|---------------|----------------|------------|-------------|
+| `init` | Public (once) | n/a | None | Initialize vault, token, UnifiedAuth |
+| `set_backend_status` | VaultAdmin or EmergencyAdmin | Rejected while paused | `require_vault_or_emergency_admin` | Toggle backend online/offline |
+| `pause` | VaultAdmin or EmergencyAdmin | Sets paused | `require_vault_or_emergency_admin` | Block new deposits |
+| `unpause` | VaultAdmin or EmergencyAdmin | Clears paused | `require_vault_or_emergency_admin` | Re-enable deposits |
+| `recovery` | VaultAdmin or EmergencyAdmin | Allowed | `require_vault_or_emergency_admin` | Cancel a pending force-exit |
+| `propose_upgrade` | UpgradeAdmin | Rejected while paused | `require_upgrade_admin` | Start upgrade timelock |
+| `cancel_upgrade` | UpgradeAdmin | Allowed | `require_upgrade_admin` | Abort pending upgrade |
+| `apply_upgrade` | Public after timelock | n/a | None after unlock | Deploy pending WASM |
+| `transfer_admin` | Current admin | Allowed | `require_legacy_admin` | Rotate legacy admin |
+| `set_unified_auth` | Current admin | Allowed | `require_legacy_admin` | Set UnifiedAuth contract |
+| `deposit` | Owner | Rejected while paused | `user.require_auth()` | Deposit vault token |
+| `withdrawal` | Owner | Allowed | `user.require_auth()` | Withdraw vault token |
+| `force_exit_request` | Owner | Allowed | `user.require_auth()` | Start force-exit when backend offline |
+| `force_exit_complete` | Owner | Allowed | `user.require_auth()` | Claim after challenge period |
+| `get_deposit` / `get_force_exit` / `is_paused` / `is_backend_online` / `auth_nonce` | Public | n/a | None | Read-only |
 
 ### Admin Permissions
 
@@ -657,8 +665,50 @@ User → Contract A → Contract B (with auth)
 
 1. **Contract Address Immutability**: Called contract addresses should be immutable or require admin approval
 2. **Role Verification**: Cross-contract calls should verify roles via RBAC
-3. **Reentrancy Protection**: Soroban's atomic model prevents reentrancy
+3. **Nested Call Authorization**: Atomic execution prevents reentrancy but does not protect against confused-deputy reuse; authorization must be bound to the exact immediate invocation
 4. **Interface Compliance**: Called contracts must implement expected interfaces
+
+### Nested Invocation Authorization Model
+
+Soroban authentication authorizes only the immediate invocation of a contract function using the caller's signature. Nested invocation paths are modeled as `User -> Contract A -> Contract B -> Contract C`, with each hop evaluated only at the exact `require_auth()` boundary. A privileged entry point must not assume that the direct caller is the originator or that an authorization tree created for one call graph is valid for another. Every privileged cross-contract call binds the exact contract ID, function name, argument hash, and nonce where applicable.
+
+#### Trust Assumptions per Privileged Cross-Contract Call
+
+| Caller Contract | Called Contract | Trust Assumption |
+|-----------------|-----------------|------------------|
+| BTC Relay | BTC Relay Crypto | Cryptography contract is immutable and only verifies SPV proofs; admin replacement is a governed action |
+| Flash Loan Guard | Price Oracle | Oracle is honest and exactly the configured address; nested calls cannot substitute another oracle |
+| Multi-Hop Swap | Pool Contracts | Pool addresses in hop parameters are user-approved and invariant during nested execution |
+| All Contracts | RBAC | RBAC address is fixed after initialization and role checks use authenticated caller identity, not `env.caller()` |
+
+#### Exact Authorization Binding
+
+Privileged functions must authenticate with `require_auth()` using the full invocation context. The authorization payload implicitly or explicitly includes:
+
+- **Contract**: the contract ID of the privileged entry point
+- **Function**: the exact function name being invoked
+- **Arguments**: the full encoded argument vector of that invocation
+- **Nonce**: the caller's current nonce, where required by the Soroban account/contract authorization framework
+
+This binding prevents an authorization produced for `swap` from being replayed on `withdraw`, and prevents a nested intermediary from re-authorizing the same payload against a different target.
+
+#### Adversarial Intermediary-Contract Tests
+
+The following adversarial tests must be included in the contract test suite:
+
+1. A malicious intermediary contract invokes a privileged function with the victim's valid authorization payload; the call must fail unless the payload exactly matches the privileged entry point.
+2. A malicious intermediary contract re-enters a privileged contract after a nested call; the authorization context must not be reused for a different function or arguments.
+3. An authorization tree created for a direct call is submitted through a two-contract nested path; the second contract must reject it if the contract ID or function does not match.
+4. A relayer or agent contract forwards a user operation to a privileged entry point with additional arguments; the nested call must fail if the forwarded payload differs from the authenticated operation.
+5. Nested invocation depth is varied from 0 to the protocol maximum; authorization invariants remain unchanged.
+
+#### Security Invariants under Arbitrary Nesting Depth
+
+- Invariant 1: For any privileged function `f` on contract `C`, `f` executes only if the immediate caller's authorization payload names exactly `C`, `f`, and the submitted arguments.
+- Invariant 2: A valid authorization payload for one contract, function, or argument set cannot be used to authorize a different contract, function, or argument set, regardless of nesting depth.
+- Invariant 3: A nested intermediary cannot extend, weaken, or re-target an authorization payload it did not create.
+- Invariant 4: No privileged entry point relies on `env.caller()` as an identity claim for funds or roles; identity is always the authenticated `Address`.
+- Invariant 5: Protocol nesting-depth limits are enforced by Soroban runtime; within those limits every invariant is proven by the exact-binding property above.
 
 ---
 

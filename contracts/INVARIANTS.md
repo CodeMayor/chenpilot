@@ -4,6 +4,8 @@ This document defines the invariants (safety properties) that must hold for each
 
 ## Table of Contents
 - [Common Invariants](#common-invariants)
+- [Multi-Region Failover Invariants](#multi-region-failover-invariants)
+- [Cross-Contract Authorization Invariants](#cross-contract-authorization-invariants)
 - [BTC Relay Invariants](#btc-relay-invariants)
 - [RBAC Invariants](#rbac-invariants)
 - [Multi-Hop Swap Invariants](#multi-hop-swap-invariants)
@@ -14,6 +16,7 @@ This document defines the invariants (safety properties) that must hold for each
 - [Intent Market Validator Invariants](#intent-market-validator-invariants)
 - [Lending Liquidation Invariants](#lending-liquidation-invariants)
 - [Liquidity Vault Invariants](#liquidity-vault-invariants)
+- [Oracle Aggregator Invariants](#oracle-aggregator-invariants)
 - [PoR Validator Invariants](#por-validator-invariants)
 - [Relayer Slashing Invariants](#relayer-slashing-invariants)
 - [Strategy Registry Invariants](#strategy-registry-invariants)
@@ -49,6 +52,124 @@ This document defines the invariants (safety properties) that must hold for each
 **Formal**: `∀ state_change: ∃ event_emission`
 
 **Enforcement**: Event publishing after each state modification.
+
+---
+
+## Multi-Region Failover Invariants
+
+These invariants preserve single-writer safety for durable operations and financial side effects across regional control planes. The goal is to make split-brain execution (two regions executing the same durable operation or allocating conflicting sequence numbers) impossible, not merely unlikely.
+
+### Definitions
+- **Epoch**: A strictly monotonic integer identifying the current ownership generation. Each promotion increments the epoch. Persisted in a linearizable, quorum-backed store (the fence store).
+- **Owner**: The single region whose epoch equals the current fence epoch. Only the owner may execute durable operations.
+- **Fence token**: The epoch value stamped on every durable side effect and sequence allocation.
+- **Durable operation**: Any operation with an external, non-idempotent financial side effect or that allocates a global sequence number.
+
+### MRF1: Epoch Fence Required for Execution
+**Invariant**: No region may execute a durable operation without holding a valid epoch fence equal to the current fence-store epoch.
+
+**Formal**: `execute(op) ⇒ region.epoch == fence_store.current_epoch()`
+
+**Enforcement**: The fence epoch is read (or leased with a bounded TTL) and re-validated against the linearizable fence store at the point of execution; any mismatch aborts the operation before side effects. Satisfies acceptance criterion: no region can execute without a valid epoch fence.
+
+### MRF2: Epoch Monotonicity
+**Invariant**: The fence epoch strictly increases and never repeats or decreases.
+
+**Formal**: `epoch(t+1) > epoch(t)`
+
+**Enforcement**: Compare-and-swap increment on the fence store during promotion; a promotion that cannot advance the epoch is rejected.
+
+### MRF3: Single Owner
+**Invariant**: At most one region holds the current epoch at any time.
+
+**Formal**: `|{r | r.epoch == fence_store.current_epoch()}| <= 1`
+
+**Enforcement**: Ownership is a quorum-linearizable lease keyed by epoch; acquiring epoch N atomically invalidates all leases for epochs < N.
+
+### MRF4: Fenced Sequence Allocation
+**Invariant**: Every allocated sequence number is stamped with the allocating epoch, and allocations from a stale epoch are rejected.
+
+**Formal**: `alloc(seq) ⇒ seq.epoch == fence_store.current_epoch() ∧ (epoch, seq) unique`
+
+**Enforcement**: Sequence allocator conditions each allocation on the current fence epoch (CAS); writes tagged with a superseded epoch are rejected by the durable store. Prevents conflicting sequence numbers across regions.
+
+### MRF5: Stale-Writer Rejection
+**Invariant**: A demoted or partitioned former owner cannot commit side effects after a higher epoch exists.
+
+**Formal**: `write.epoch < fence_store.current_epoch() ⇒ write rejected`
+
+**Enforcement**: Durable stores and external effect gateways enforce a monotonic epoch guard on every write, rejecting any write carrying an epoch lower than the highest observed. This is the mechanism that network-partition tests exercise to prove split-brain rejection.
+
+### MRF6: Promotion Requires Verified Data and Chain-State Freshness
+**Invariant**: A region may be promoted to owner only after its replicated data and chain state are verified fresh and consistent up to the last committed operation of the prior epoch.
+
+**Formal**: `promote(region) ⇒ region.replication_lag == 0 ∧ region.chain_head_verified ∧ region.last_applied_seq >= prior_epoch.max_committed_seq`
+
+**Enforcement**: Promotion procedure blocks epoch increment until replication catch-up, integrity verification, and chain-state freshness checks pass; otherwise promotion is denied. Satisfies acceptance criterion: promotion requires verified data and chain-state freshness.
+
+### MRF7: Data Replication Durability Before Ack
+**Invariant**: A durable operation is acknowledged only after its effect and fence stamp are replicated to a quorum sufficient to survive the target failure domain.
+
+**Formal**: `ack(op) ⇒ replicated(op, quorum)`
+
+**Enforcement**: Synchronous quorum replication of the effect log and fence metadata prior to returning success, ensuring a promoted region can reconstruct authoritative state.
+
+### MRF8: Split-Brain Rejection Under Partition
+**Invariant**: During a network partition, a region that cannot confirm ownership against a quorum must not execute durable operations.
+
+**Formal**: `partitioned(region) ∧ ¬quorum_confirms(region.epoch) ⇒ ¬execute(durable_op)`
+
+**Enforcement**: Ownership leases require quorum confirmation with bounded TTL; on lease expiry or loss of quorum contact the region fences itself off (stops durable execution) before the prior lease can be reissued elsewhere. Verified by network-partition tests that assert the minority side rejects all durable operations.
+
+### MRF9: Documented Recovery Objectives and Override Risk
+**Invariant**: Recovery objectives and the risk profile of any manual override are explicitly documented and gated.
+
+**Formal**: `manual_override ⇒ documented ∧ authorized ∧ audited`
+
+**Enforcement**:
+- **RPO (Recovery Point Objective)**: 0 for financial side effects — no acknowledged durable operation may be lost, guaranteed by MRF7 quorum durability. Best-effort for non-durable telemetry.
+- **RTO (Recovery Time Objective)**: Bounded by lease TTL plus promotion verification time (MRF6); target documented per deployment.
+- **Manual override**: Forcing promotion without passing MRF6 verification, or manually advancing the epoch, can cause data loss or execution of operations against stale chain state. Overrides are therefore:
+  1. Restricted to break-glass credentials with multi-party authorization.
+  2. Required to explicitly acknowledge the RPO/consistency risk being accepted.
+  3. Fully audited via event emission (see I4) with the operator identity and justification.
+  Overriding MRF1–MRF5 (the fencing chain) is prohibited even under break-glass, because it directly reintroduces split-brain risk.
+
+---
+
+## Cross-Contract Authorization Invariants
+
+### CCA1: Trust Boundary Documentation
+
+**Invariant**: Every privileged cross-contract call must document its trust assumptions and trusted caller.
+
+**Formal**: `∀ call ∈ privileged_cross_contract_calls: trust_documented(call) == true`
+
+**Enforcement**: Contract interfaces and design notes identify the trusted caller, entry point, and authorization scope.
+
+### CCA2: Exact Authorization Binding
+
+**Invariant**: Authorization binds the exact contract, function, arguments, and nonce where applicable.
+
+**Formal**: `authorized(ctx) ⇒ ctx == (contract_id, function, args_hash, nonce)`
+
+**Enforcement**: `require_auth` validates the full invocation payload; partial, forwarded, or replayed auth contexts are rejected.
+
+### CCA3: Nested Invocation Preservation
+
+**Invariant**: Authorization invariants hold for any nested invocation depth within protocol limits; an intermediary cannot confuse the deputy.
+
+**Formal**: `∀ depth ≤ max_invocation_depth: auth_context(depth) == auth_context(0)`
+
+**Enforcement**: Nested cross-contract calls preserve the originating authorized invocation path and never re-authorize with caller authority for unintended arguments.
+
+### CCA4: Adversarial Intermediary Coverage
+
+**Invariant**: The test suite includes adversarial intermediary contracts that attempt authorization replay and confused-deputy attacks.
+
+**Formal**: `∀ adversarial_intermediary ∈ tests: security_invariants_hold`
+
+**Enforcement**: Integration tests deploy malicious intermediaries that re-enter, forward, and reuse auth contexts; invariant violations panic or revert.
 
 ---
 
@@ -439,6 +560,80 @@ This document defines the invariants (safety properties) that must hold for each
 **Formal**: `amount_out >= min_amount_out`
 
 **Enforcement**: Slippage check on swap.
+
+---
+
+## Oracle Aggregator Invariants
+
+### OA1: Governance-Only Source Management
+**Invariant**: Sources can only be added, updated, or removed by admin.
+
+**Formal**: `add_source(...) | update_source(...) | remove_source(...) ⇒ caller == config.admin`
+
+**Enforcement**: `config.admin.require_auth()` on all three functions.
+
+### OA2: Weight Bounds
+**Invariant**: Every registered source has a weight in (0, 10000] bps.
+
+**Formal**: `0 < source.weight_bps <= 10000`
+
+**Enforcement**: Range check in `add_source` / `update_source`.
+
+### OA3: Source Count Bound
+**Invariant**: The registered source set never exceeds `MAX_SOURCES`.
+
+**Formal**: `source_list.len() <= MAX_SOURCES`
+
+**Enforcement**: Length check in `add_source` before registration.
+
+### OA4: Staleness Exclusion
+**Invariant**: A reading older than the staleness bound is never counted toward quorum or the median.
+
+**Formal**: `current_time > reading.timestamp + max_staleness_seconds ⇒ reading excluded`
+
+**Enforcement**: Freshness filter in `compute_aggregate`.
+
+### OA5: Quorum Before Median (Pass 1)
+**Invariant**: A median is only computed over a set that already meets both quorum thresholds.
+
+**Formal**: `fresh.count >= min_quorum_sources ∧ fresh.weight_bps >= min_quorum_weight_bps` before `weighted_median(fresh)` is called.
+
+**Enforcement**: `require(...)` checks in `compute_aggregate` precede the first `weighted_median` call.
+
+### OA6: Bounded Disagreement
+**Invariant**: Every source contributing to the final price is within `max_deviation_bps` of the preliminary median.
+
+**Formal**: `∀ r ∈ in_band: |r.price - prelim_median| / prelim_median <= max_deviation_bps / 10000`
+
+**Enforcement**: Deviation filter (pass 2) in `compute_aggregate`.
+
+### OA7: Quorum After Filtering (Pass 2)
+**Invariant**: If deviation filtering breaks quorum, the call fails instead of returning a price.
+
+**Formal**: `in_band.count < min_quorum_sources ∨ in_band.weight_bps < min_quorum_weight_bps ⇒ panic(ExcessiveSourceDisagreement)`
+
+**Enforcement**: `require(...)` checks in `compute_aggregate` after the deviation filter.
+
+### OA8: Fault-Isolated Source Reads
+**Invariant**: A single reverting/unreachable source cannot abort aggregation for the others.
+
+**Formal**: `source.get_price() panics ⇒ source excluded (sources_rejected_unavailable += 1), aggregation continues`
+
+**Enforcement**: `try_get_price()` (fallible cross-contract call) instead of `get_price()` in `compute_aggregate`.
+
+### OA9: Overflow-Safe Normalization
+**Invariant**: Decimal normalization never wraps or silently overflows.
+
+**Formal**: `normalize_checked(price, from, to)` uses `checked_mul` / `checked_div` / `checked_pow` throughout; any overflow panics with `ArithmeticError`.
+
+**Enforcement**: Checked arithmetic in `normalize_checked` / `checked_pow10`.
+
+### OA10: Degraded-Read Safety
+**Invariant**: A cached aggregate is only ever served if it is still within the staleness bound.
+
+**Formal**: `get_latest() ⇒ current_time <= last_aggregate.timestamp + max_staleness_seconds`, else panic.
+
+**Enforcement**: Freshness check in `get_latest`.
 
 ---
 

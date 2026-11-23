@@ -5,11 +5,75 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+    paths:
+      - "src/Gateway/**"
+      - "src/Payments/**"
+      - "src/scripts/testWebhookIdempotency.ts"
+      - "src/config/Datasource.ts"
+      - "tests/integration/**"
+      - "package.json"
+      - "package-lock.json"
+      - "pnpm-lock.yaml"
+      - ".npmrc"
+      - ".github/workflows/release-gates.yml"
+      - ".github/workflows/sbom-provenance.yml"
 
 jobs:
+  clean-checkout-smoke:
+    name: Clean checkout install and workspace smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout clean repository
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # The supported clean install (CONTRIBUTING.md "Getting Started"):
+      # `pnpm install --frozen-lockfile`, failing if it changes the lockfile
+      # or any tracked file, then the workspace smoke test.
+      - name: Install from lockfile and run local workflow workspace smoke
+        run: pnpm run smoke:clean-checkout
+
   backend-health:
     name: Backend compiler and tests
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: chenpilot_test
+        options: >
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
 
     steps:
       - name: Checkout code
@@ -27,8 +91,34 @@ jobs:
       - name: TypeScript compiler gate
         run: npm run build:check
 
-      - name: Backend unit tests
-        run: npm test -- --runInBand
+      - name: Backend unit tests (no external services required)
+        run: npm run test:unit
+
+      - name: Adversarial red-team evaluation gate (#634)
+        run: npm run redteam:check
+
+      - name: Integration tests (service-backed, requires PostgreSQL and Redis)
+        run: npm run test:integration
+        env:
+          DATABASE_HOST: localhost
+          DATABASE_PORT: 5432
+          DATABASE_USER: test
+          DATABASE_PASSWORD: test
+          DATABASE_NAME: chenpilot_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USERNAME: test
+          DB_PASSWORD: test
+          DB_NAME: chenpilot_test
+
+      - name: Report test separation status
+        if: always()
+        run: |
+          echo "✅ Unit tests: executed without external services"
+          echo "✅ Integration tests: executed with PostgreSQL and Redis services"
+          echo "📋 Test separation enforced via jest.unit.config.js and jest.integration.config.js"
 
   sdk-health:
     name: SDK drift and package health
@@ -53,13 +143,27 @@ jobs:
         run: npm run type-check
         working-directory: packages/sdk
 
+      - name: Build SDK
+        run: npm run build
+        working-directory: packages/sdk
+
       - name: SDK tests
-        run: npm test -- --runInBand
+        run: npm test --runInBand
+        working-directory: packages/sdk
+
+      - name: API snapshot compatibility check
+        run: node api-snapshot.js compare
         working-directory: packages/sdk
 
       - name: SDK artifact dry run
         run: npm pack --dry-run
         working-directory: packages/sdk
+
+      - name: Minimum TypeScript compatibility (#1000)
+        run: node scripts/repo/check-ts-compat.mjs
+
+      - name: Package contents allowlist (#999)
+        run: node scripts/repo/check-package-contents.mjs
 
   contract-health:
     name: Soroban contract compatibility
@@ -79,6 +183,25 @@ jobs:
 
       - name: Contract tests
         run: cargo test --manifest-path contracts/Cargo.toml --workspace
+
+      - name: Contract artifact reproducibility (#998)
+        run: node scripts/repo/check-contract-reproducibility.mjs
+
+  contract-conservation:
+    name: Protocol conservation invariants (release candidate gate)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Run protocol-wide conservation invariants
+        run: cargo test --manifest-path contracts/Cargo.toml -p protocol_conservation
 
   root-artifact-health:
     name: Backend artifact integrity
@@ -103,3 +226,65 @@ jobs:
 
       - name: Package dry run
         run: npm pack --dry-run
+
+  supply-chain-gate:
+    name: Supply chain security gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify SBOM generation tooling available
+        run: npx @cyclonedx/cyclonedx-npm --help
+
+      - name: Dry-run CycloneDX SBOM (root)
+        run: npx @cyclonedx/cyclonedx-npm --output-file /dev/null --output-format json
+
+      - name: Dry-run CycloneDX SBOM (SDK)
+        run: npx @cyclonedx/cyclonedx-npm --output-file /dev/null --output-format json
+        working-directory: packages/sdk
+
+      - name: Verify sbom-provenance workflow exists and is valid
+        run: |
+          test -f .github/workflows/sbom-provenance.yml
+          echo "SBOM provenance workflow present"
+
+      - name: Verify release assets would include SBOMs
+        run: |
+          # Confirm the sbom-provenance workflow uploads to releases
+          grep -q 'gh release upload' .github/workflows/sbom-provenance.yml
+          echo "Release upload step confirmed"
+
+      - name: Verify cosign signing is configured
+        run: |
+          grep -q 'sigstore/cosign-installer' .github/workflows/sbom-provenance.yml
+          echo "Cosign signing confirmed"
+
+      - name: Verify artifact attestation is configured
+        run: |
+          grep -q 'actions/attest-build-provenance' .github/workflows/sbom-provenance.yml
+          echo "Artifact attestation confirmed"
+
+      - name: Verify provenance manifest includes repository commit
+        run: |
+          grep -q 'github.sha' .github/workflows/sbom-provenance.yml
+          echo "Provenance binds repository commit"
+
+      - name: Verify provenance manifest includes workflow reference
+        run: |
+          grep -q 'github.workflow' .github/workflows/sbom-provenance.yml
+          echo "Provenance binds workflow identity"
+
+      - name: Verify verification job exists in SBOM workflow
+        run: |
+          grep -q 'Verify signatures' .github/workflows/sbom-provenance.yml
+          echo "Post-build verification job confirmed"

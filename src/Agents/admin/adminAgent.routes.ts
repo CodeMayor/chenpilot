@@ -7,9 +7,24 @@ import { promptRolloutService } from "../registry/PromptRolloutService";
 import { durableExecutor } from "../planner/DurableExecutor";
 import { durableOperationService } from "../../Reliability/DurableOperationService";
 import { OperationStatus } from "../../Reliability/DurableOperation.entity";
+import { requireAdminWorkflow } from "./workflow.middleware";
+import { SensitiveActionType } from "./workflow.types";
 import AppDataSource from "../../config/Datasource";
+import interventionRouter from "../planner/intervention.routes";
 
 const router = Router();
+
+/**
+ * Mount intervention routes: /api/admin/agents/interventions/...
+ *
+ * Provides signed operator interventions for stuck/failed durable executions:
+ *   POST /submit       — apply a signed intervention command
+ *   POST /dry-run      — preview state changes without committing
+ *   GET  /executions/:executionId — list interventions for an execution
+ *   GET  /:id          — get a single intervention record
+ *   POST /sign-helper  — compute the canonical signing payload
+ */
+router.use("/interventions", interventionRouter);
 
 /**
  * GET /api/admin/reliability/operations
@@ -22,12 +37,13 @@ router.get(
   async (req: Request, res: Response) => {
     try {
       const { status, category, limit, offset } = req.query;
-      const [operations, total] = await durableOperationService.getAllOperations({
-        status: status as OperationStatus,
-        category: category as string,
-        limit: limit ? parseInt(limit as string, 10) : 50,
-        offset: offset ? parseInt(offset as string, 10) : 0,
-      });
+      const [operations, total] =
+        await durableOperationService.getAllOperations({
+          status: status as OperationStatus,
+          category: category as string,
+          limit: limit ? parseInt(limit as string, 10) : 50,
+          offset: offset ? parseInt(offset as string, 10) : 0,
+        });
 
       return res.status(200).json({
         success: true,
@@ -64,7 +80,8 @@ router.post(
       console.error("Error replaying operation:", error);
       return res.status(500).json({
         success: false,
-        message: error instanceof Error ? error.message : "Failed to replay operation",
+        message:
+          error instanceof Error ? error.message : "Failed to replay operation",
       });
     }
   }
@@ -117,7 +134,8 @@ router.post(
       console.error("Error retrying step:", error);
       return res.status(500).json({
         success: false,
-        message: error instanceof Error ? error.message : "Failed to retry step",
+        message:
+          error instanceof Error ? error.message : "Failed to retry step",
       });
     }
   }
@@ -136,7 +154,11 @@ router.post(
     try {
       const { id, step } = req.params;
       const { resultOverride } = req.body;
-      await durableExecutor.repairSkipStep(id, parseInt(step, 10), resultOverride);
+      await durableExecutor.repairSkipStep(
+        id,
+        parseInt(step, 10),
+        resultOverride
+      );
       return res.status(200).json({
         success: true,
         message: `Skipped step ${step} for execution ${id}`,
@@ -164,7 +186,11 @@ router.post(
     try {
       const { id, step } = req.params;
       const { newPayload } = req.body;
-      await durableExecutor.repairUpdateAndRetry(id, parseInt(step, 10), newPayload);
+      await durableExecutor.repairUpdateAndRetry(
+        id,
+        parseInt(step, 10),
+        newPayload
+      );
       return res.status(200).json({
         success: true,
         message: `Updated and retrying step ${step} for execution ${id}`,
@@ -173,7 +199,10 @@ router.post(
       console.error("Error updating and retrying step:", error);
       return res.status(500).json({
         success: false,
-        message: error instanceof Error ? error.message : "Failed to update and retry step",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to update and retry step",
       });
     }
   }
@@ -192,9 +221,9 @@ router.post(
     try {
       const { id } = req.params;
       const adminId = req.user?.userId;
-      
+
       await durableExecutor.resumeExecution(id, adminId);
-      
+
       return res.status(200).json({
         success: true,
         message: `Execution ${id} approved and resumed`,
@@ -203,7 +232,10 @@ router.post(
       console.error("Error approving execution:", error);
       return res.status(500).json({
         success: false,
-        message: error instanceof Error ? error.message : "Failed to approve execution",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to approve execution",
       });
     }
   }
@@ -533,6 +565,7 @@ router.get(
 router.put(
   "/tools/:toolId/toggle",
   requireAdminAuth(),
+  requireAdminWorkflow(SensitiveActionType.ENABLE_TOOL),
   async (req: Request, res: Response) => {
     try {
       const { toolId } = req.params;

@@ -8,6 +8,8 @@ This document is automatically generated. Do not edit manually.
   - [contact_tool](#contact-tool)
 - [DEFI](#defi)
   - [multi_hop_trade](#multi-hop-trade)
+- [DIAGNOSTICS](#diagnostics)
+  - [reconciliation_tool](#reconciliation-tool)
 - [GENERAL](#general)
   - [get_xlm_liquidity](#get-xlm-liquidity)
 - [META](#meta)
@@ -60,7 +62,32 @@ Manage contacts: create, list, and delete contacts.
 
 ### multi_hop_trade
 
-Evaluate and find optimal multi-hop trading paths across Stellar DEX using multiple intermediate assets
+Evaluate or execute optimal multi-hop trading paths across Stellar DEX.
+
+**Version:** 2.0.0
+
+#### Parameters
+
+| Parameter | Type | Required | Description | Options |
+| --- | --- | --- | --- | --- |
+| operation | string | Yes | evaluate (inspect routes) or execute (submit trade) | `evaluate`, `execute` |
+| fromAsset | string | Yes | Source asset symbol | `XLM`, `USDC`, `USDT` |
+| toAsset | string | Yes | Destination asset symbol | `XLM`, `USDC`, `USDT` |
+| amount | number | Yes | Amount of source asset | - |
+
+#### Examples
+
+- Evaluate best path to swap 100 XLM to USDC
+- Execute multi-hop trade: 500 XLM → USDT with max 3 hops
+- Find routes from USDC to USDT with minEfficiency 0.9
+
+---
+
+## DIAGNOSTICS
+
+### reconciliation_tool
+
+Detect and surface drift between backend records and on-chain reality. Checks transaction status, wallet balances, contract state for inconsistencies. Optionally evaluates system-level accounting invariants for aggregate balance integrity, pending operation health, and completeness.
 
 **Version:** 1.0.0
 
@@ -68,15 +95,16 @@ Evaluate and find optimal multi-hop trading paths across Stellar DEX using multi
 
 | Parameter | Type | Required | Description | Options |
 | --- | --- | --- | --- | --- |
-| fromAsset | string | Yes | Source asset symbol (e.g., XLM, USDC, USDT) | `XLM`, `USDC`, `USDT` |
-| toAsset | string | Yes | Destination asset symbol (e.g., XLM, USDC, USDT) | `XLM`, `USDC`, `USDT` |
-| amount | number | Yes | Amount of source asset to trade | - |
+| operation | string | Yes | Operation to perform | `run`, `get_reports` |
+| scope | object | No | Reconciliation scope: which checks to run and against which entities | - |
+| limit | number | No | Number of past reports to retrieve (for get_reports) | - |
 
 #### Examples
 
-- Find best path to swap 100 XLM to USDC
-- Evaluate multi-hop routes from USDC to USDT with max 3 hops
-- Compare trading paths for 500 XLM to USDT
+- Run reconciliation to check if my transactions match on-chain
+- Check for balance drift on my wallet
+- Show me recent reconciliation reports
+- Reconcile contract state for contract CXXX
 
 ---
 
@@ -294,7 +322,7 @@ Fetch statistics for a Stellar AMM liquidity pool by pool ID, including reserves
 
 ### strategy_registry
 
-Interact with the Yield-Aggregator Strategy Registry to vote on Stellar DEX pools or check verification status.
+Interact with the Yield‑Aggregator Strategy Registry to vote on Stellar DEX pools, revoke votes, or retrieve the verified strategy.
 
 **Version:** 1.0.0
 
@@ -302,15 +330,17 @@ Interact with the Yield-Aggregator Strategy Registry to vote on Stellar DEX pool
 
 | Parameter | Type | Required | Description | Options |
 | --- | --- | --- | --- | --- |
-| action | string | Yes | Action to perform:  | - |
-| poolId | string | No | 64-character hexadecimal Stellar AMM liquidity pool ID | - |
+| action | string | Yes | Action to perform:  | `vote`, `revoke_vote`, `get_strategy`, `is_verified` |
+| poolId | string | No | 64‑character hexadecimal Stellar AMM liquidity pool ID | - |
 | aiAgent | string | No | The public key of the AI agent casting the vote (required for  | - |
+| revokeVote | boolean | No | If true, the existing vote will be revoked instead of added | - |
 
 #### Examples
 
-- Vote for pool abc123...
-- What is the current yield strategy?
-- Is this pool verified by the registry?
+- vote pool 0123... with agent GAB...
+- revoke_vote pool 0123... with agent GAB...
+- get_strategy
+- is_verified pool 0123...
 
 ---
 

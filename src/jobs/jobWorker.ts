@@ -1,6 +1,13 @@
 import logger from "../config/logger";
 import { QueueJob } from "./job.entity";
 import { JobQueueService, jobQueueService } from "./jobQueue.service";
+import { propagateJobContext } from "../observability/jobContext";
+import {
+  AuthenticatedActor,
+  authorizeJobOperation,
+  JOB_AUTH_METADATA_KEY,
+  StoredJobAuthContext,
+} from "../Security/authorization/channelAdapters";
 
 export type JobHandlerResult =
   | { outcome: "completed"; result?: Record<string, unknown> }
@@ -10,6 +17,12 @@ export type JobHandlerResult =
 
 export interface JobHandler {
   jobType: string;
+  /**
+   * Catalog operation this job performs on a user's behalf. When set, the job
+   * is authorized as its originating user under the current policy before
+   * the handler runs, exactly as if the user invoked it directly.
+   */
+  operation?: string;
   handle(job: QueueJob): Promise<JobHandlerResult | void>;
 }
 
@@ -21,6 +34,33 @@ export interface JobWorkerOptions {
   concurrency?: number;
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
+  /** Re-reads a job's originating user (role, suspension) at execution time. */
+  resolveJobActor?: (userId: string) => Promise<AuthenticatedActor | undefined>;
+}
+
+async function resolveActorFromDatabase(userId: string): Promise<AuthenticatedActor | undefined> {
+  const [{ default: AppDataSource }, { User }] = await Promise.all([
+    import("../config/Datasource"),
+    import("../Auth/user.entity"),
+  ]);
+  const user = await AppDataSource.getRepository(User).findOne({ where: { id: userId }, select: ["id", "role"] });
+  return user ? { userId: user.id, role: user.role } : undefined;
+}
+
+/**
+ * Jobs enqueued without an explicit auth context (e.g. before contexts were
+ * captured) are attributed to their owning user arriving over HTTP.
+ */
+function storedAuthContext(job: QueueJob): unknown {
+  const stored = job.metadata?.[JOB_AUTH_METADATA_KEY];
+  if (stored || !job.userId) return stored;
+  const fallback: StoredJobAuthContext = {
+    originPrincipalId: job.userId,
+    originRole: "user",
+    originChannel: "http",
+    policyVersion: "unversioned",
+  };
+  return fallback;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -132,6 +172,49 @@ export class JobWorker {
       attempt: job.attempts + 1,
     });
 
+    // ---------------------------------------------------------------------------
+    // Safe-point check: re-read the job status from the database before starting
+    // the handler.  This prevents invoking an irreversible side effect on a job
+    // that was cancelled after it was leased but before the handler ran.
+    //
+    // The check window is intentionally narrow (between lease acquisition and
+    // handler invocation) so that jobs already mid-handler are not interrupted —
+    // handlers must manage their own internal cancellation if needed.
+    // ---------------------------------------------------------------------------
+    const freshJob = await this.queueService.getJob(job.id);
+    if (!freshJob || freshJob.status === "cancelled") {
+      logger.info("Job cancelled before handler invocation — skipping", {
+        jobId: job.id,
+        jobType: job.jobType,
+        status: freshJob?.status ?? "not_found",
+      });
+      return;
+    }
+
+    if (handler.operation) {
+      const decision = await authorizeJobOperation(
+        storedAuthContext(job),
+        handler.operation,
+        job.id,
+        this.options.resolveJobActor ?? resolveActorFromDatabase,
+      );
+      if (!decision.allowed) {
+        await this.queueService.deadLetterJob(
+          job.id,
+          this.options.workerId,
+          `Authorization denied: ${decision.reason} (decision ${decision.decisionId})`,
+        );
+        logger.warn("Job dead-lettered by authorization policy", {
+          jobId: job.id,
+          jobType: job.jobType,
+          operation: handler.operation,
+          reason: decision.reason,
+          decisionId: decision.decisionId,
+        });
+        return;
+      }
+    }
+
     const keepAlive = setInterval(() => {
       void this.queueService
         .renewLease(job.id, this.options.workerId, this.leaseMs)
@@ -152,7 +235,7 @@ export class JobWorker {
     }, Math.max(1000, Math.floor(this.leaseMs / 2)));
 
     try {
-      const result = (await handler.handle(job)) ?? { outcome: "completed" as const };
+      const result = await propagateJobContext(job, async () => (await handler.handle(job)) ?? { outcome: "completed" as const });
 
       switch (result.outcome) {
         case "completed":

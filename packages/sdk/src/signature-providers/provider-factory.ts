@@ -1,6 +1,9 @@
 import { ChainId } from "../types";
 import { SignatureProvider } from "./interfaces";
-import { AlbedoSignatureProvider, AlbedoProviderConfig } from "./albedo-provider";
+import {
+  AlbedoSignatureProvider,
+  AlbedoProviderConfig,
+} from "./albedo-provider";
 import {
   SignatureProviderRegistry,
   signatureProviderRegistry,
@@ -29,7 +32,10 @@ class ProviderFactoryError extends SignatureProviderError {
 }
 
 /**
- * Provider type identifiers
+ * Provider type identifiers.
+ *
+ * Canonical definition lives here; {@link ./types} re-exports it so consumers
+ * can import `ProviderType` from either entry point without a circular import.
  */
 export enum ProviderType {
   MOCK = "mock",
@@ -245,7 +251,7 @@ export class SignatureProviderFactory {
 
     const configs: ProviderConfig[] = availableProviders
       .filter((discovery) => this.supportsChain(discovery.type, chainId))
-      .map((discovery) => ({ type: discovery.type } as ProviderConfig));
+      .map((discovery) => ({ type: discovery.type }) as ProviderConfig);
 
     if (configs.length === 0) {
       throw new UnsupportedChainError(chainId);
@@ -265,7 +271,7 @@ export class SignatureProviderFactory {
       requireUserInteraction?: boolean;
     } = {}
   ): Promise<SignatureProvider> {
-    const registry = this.config.defaultRegistry;
+    const registry = this.config.defaultRegistry ?? signatureProviderRegistry;
     const candidates = registry.resolveProviders(
       chainId,
       preferences as ProviderSelectionPreferences
@@ -333,7 +339,9 @@ export class SignatureProviderFactory {
     return new AlbedoSignatureProvider(config);
   }
 
-  private createProviderInstance(providerConfig: ProviderConfig): SignatureProvider {
+  private createProviderInstance(
+    providerConfig: ProviderConfig
+  ): SignatureProvider {
     switch (providerConfig.type) {
       case ProviderType.MOCK:
         return this.createMockProvider(providerConfig.config);

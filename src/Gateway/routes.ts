@@ -1,8 +1,7 @@
 import { Router, Request, Response } from "express";
-import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import RateLimiterService from "./middleware/rateLimiter.service";
 import * as os from "os";
-import * as crypto from "crypto";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { container } from "tsyringe";
 import AppDataSource from "../config/Datasource";
@@ -10,44 +9,56 @@ import { User } from "../Auth/user.entity";
 import UserService from "../Auth/user.service";
 import { stellarWebhookService } from "./webhook.service";
 import { platformWebhookService } from "./platformWebhook.service";
-import { SponsorshipTransactionBuilder } from "../../packages/sdk/src/sponsorship";
-import {
-  transactionHistoryService,
-  type TransactionQueryParams,
-  type TransactionType,
-} from "./transaction.service";
 import logger from "../config/logger";
+import { sequenceLeaseService } from "../services/sequence";
 import authRoutes from "../Auth/auth.routes";
 import userPreferencesRoutes from "../Auth/userPreferences.routes";
+import botIdentityRoutes from "../Auth/botIdentity.routes";
 import dataExportRoutes from "../services/dataExport.routes";
 import contractMetadataRoutes from "../services/contracts/contractMetadata.routes";
+import contractIdentityRoutes from "../ContractIdentity/contractIdentity.routes";
 import horizonProxyRoutes from "./horizonProxy.routes";
 import auditLogRoutes from "../AuditLog/auditLog.routes";
+import rlsAuditRoutes from "../Security/rlsAudit.routes";
 import adminAgentRoutes from "../Agents/admin/adminAgent.routes";
 import governanceRoutes from "../Agents/admin/governance.routes";
 import experimentRoutes from "../Agents/admin/experiment.routes";
 import simulationRoutes from "../Agents/admin/simulation.routes";
+import workflowRoutes from "../Agents/admin/workflow.routes";
+import progressMonitorRoutes from "../Agents/planner/progressMonitor.routes";
+import transactionPreviewRoutes from "./transactionPreview.routes";
 import { stellarLiquidityTool } from "../Agents/tools/stellarLiquidityTool";
-import logger from "../config/logger";
+import { authenticateToken } from "../Auth/auth.middleware";
+import { validateBody, validateQuery } from "./middleware/validation";
+import {
+  requireAdmin,
+  requireOwnerOrElevated,
+} from "./middleware/rbac.middleware";
 import { auditLogService } from "../AuditLog/auditLog.service";
 import { AuditAction, AuditSeverity } from "../AuditLog/auditLog.entity";
-import contractRegistryRoutes from "../ContractRegistry/contractRegistry.routes";
-import { getSocketManager } from "./socketManager";
+
 import { BotSessionService } from "../Bot/botSession.service";
-import { BotSessionType, BotPlatform } from "../Bot/botSession.entity";
-import { operatorReportingService } from "../services/operatorReporting.service";
+import { createAbusePreventionMiddleware } from "../Security/abusePrevention";
+import abuseRoutes from "../Security/abusePrevention/abuse.routes";
+import authorizationRoutes from "../Security/authorization/authorization.routes";
+import { SecretAccessError, secretManager } from "../Security/secrets";
+import deploymentRoutes from "../Operations/deployment/deployment.routes";
+import circuitBreakerRoutes from "../Execution/circuitBreaker.routes";
+import { BotPlatform } from "../Bot/botSession.entity";
+import {
+  BotMetricsDto,
+  CreateBotSessionDto,
+  QueryBotSessionDto,
+  UpdateBotSessionDto,
+} from "../validators/dto/BotDto";
+import { SignupDto } from "../validators/dto/AuthDto";
+import { TransactionQueryDto } from "../validators/dto/TransactionDto";
 
 const router = Router();
 router.use(helmet());
 
-// General rate limiter
-const generalLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
-  limit: 100,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  message: { success: false, message: "Too many requests. Please slow down." },
-});
+// Redis-backed general rate limiter (shared across all instances)
+const generalLimiter = RateLimiterService.createGeneralLimiter();
 router.use(generalLimiter);
 
 // Auth routes (includes login, logout, refresh, sessions)
@@ -57,17 +68,29 @@ router.use("/auth", authExtraRoutes);
 // Mount user preferences routes
 router.use("/user/preferences", userPreferencesRoutes);
 
+// Mount bot identity routes
+router.use("/bot-identity", botIdentityRoutes);
+
 // Mount data export routes
 router.use("/export", dataExportRoutes);
 
 // Mount contract metadata discovery routes
 router.use("/contracts", contractMetadataRoutes);
 
+// Signed deployment manifests + code identity (Issue #676)
+router.use("/contract-identity", contractIdentityRoutes);
+
+// Mount KYC submission routes (with strict rate limiting)
+router.use("/kyc", kycRoutes);
+
 // Mount Horizon proxy routes (authenticated)
 router.use("/horizon", horizonProxyRoutes);
 
 // Audit logs
 router.use("/audit", auditLogRoutes);
+
+// RLS bypass audit logs (admin only)
+router.use("/security/rls-audit", rlsAuditRoutes);
 
 // Admin agent routes
 router.use("/admin/agents", adminAgentRoutes);
@@ -78,6 +101,27 @@ router.use("/admin/experiments", experimentRoutes);
 
 // Mount simulation routes (requires admin role)
 router.use("/admin/simulation", simulationRoutes);
+
+// Mount workflow routes (requires admin role)
+router.use("/admin/workflows", workflowRoutes);
+
+// Mount progress monitor routes (requires admin role)
+router.use("/planner/progress", progressMonitorRoutes);
+
+// Abuse-protection telemetry and incident response (admin only)
+router.use("/security/abuse", abuseRoutes);
+
+// Unified authorization policy (used by the bot to get the same decisions as the API)
+router.use("/authorization", authorizationRoutes);
+
+// Operations - deployment management (admin only)
+router.use("/ops/deployment", deploymentRoutes);
+
+// Execution - circuit breaker for price feeds (admin only)
+router.use("/execution/circuit-breaker", circuitBreakerRoutes);
+
+// Decoded, anti-phishing transaction previews (shared by bot and UI)
+router.use("/transactions/preview", transactionPreviewRoutes);
 router.get(
   "/admin/operator-report",
   authenticateToken,
@@ -111,223 +155,187 @@ router.get(
 );
 
 // #149: Bot command performance metrics endpoint
-router.post("/bot/metrics", async (req: Request, res: Response) => {
-  try {
-    const {
-      command,
-      platform,
-      userId,
-      executionTimeMs,
-      success,
-      error,
-      timestamp,
-    } = req.body;
+router.post(
+  "/bot/metrics",
+  validateBody(BotMetricsDto),
+  async (req: Request, res: Response) => {
+    try {
+      const metrics = req.body as BotMetricsDto;
+      const success = metrics.success === "true" || metrics.success === true;
 
-    // Validate required fields
-    if (!command || !platform || !userId || executionTimeMs === undefined) {
-      return res.status(400).json({
+      // Map bot command to audit action
+      const commandMap: Record<string, AuditAction> = {
+        "!start": AuditAction.BOT_COMMAND_START,
+        "/start": AuditAction.BOT_COMMAND_START,
+        "!help": AuditAction.BOT_COMMAND_HELP,
+        "/help": AuditAction.BOT_COMMAND_HELP,
+        "!thread": AuditAction.BOT_COMMAND_THREAD,
+        "!sponsor": AuditAction.BOT_COMMAND_SPONSOR,
+        "!trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
+        "/trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
+        "!dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
+        "/dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
+        "!validate": AuditAction.BOT_COMMAND_VALIDATE,
+        "/validate": AuditAction.BOT_COMMAND_VALIDATE,
+        "!balance": AuditAction.BOT_COMMAND_BALANCE,
+        "/balance": AuditAction.BOT_COMMAND_BALANCE,
+        "!swap": AuditAction.BOT_COMMAND_SWAP,
+        "/swap": AuditAction.BOT_COMMAND_SWAP,
+      };
+
+      const auditAction =
+        commandMap[metrics.command] || AuditAction.BOT_COMMAND_START;
+
+      // Log to audit log
+      await auditLogService.log({
+        userId: metrics.userId,
+        action: auditAction,
+        severity: success ? AuditSeverity.INFO : AuditSeverity.WARNING,
+        resource: `${metrics.platform}:${metrics.command}`,
+        metadata: {
+          platform: metrics.platform,
+          command: metrics.command,
+          executionTimeMs: metrics.executionTimeMs,
+          timestamp: metrics.timestamp,
+        },
+        errorMessage: metrics.error,
+        success,
+      });
+
+      // Also log to application logger for visibility
+      logger.info("Bot command performance metrics received", {
+        platform: metrics.platform,
+        command: metrics.command,
+        userId: metrics.userId,
+        executionTimeMs: metrics.executionTimeMs,
+        success,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "Metrics logged successfully",
+      });
+    } catch (error) {
+      logger.error("Error logging bot metrics", { error, body: req.body });
+      return res.status(500).json({
         success: false,
-        message:
-          "Missing required fields: command, platform, userId, executionTimeMs",
+        message: "Failed to log metrics",
       });
     }
-
-    // Map bot command to audit action
-    const commandMap: Record<string, AuditAction> = {
-      "!start": AuditAction.BOT_COMMAND_START,
-      "/start": AuditAction.BOT_COMMAND_START,
-      "!help": AuditAction.BOT_COMMAND_HELP,
-      "/help": AuditAction.BOT_COMMAND_HELP,
-      "!thread": AuditAction.BOT_COMMAND_THREAD,
-      "!sponsor": AuditAction.BOT_COMMAND_SPONSOR,
-      "!trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
-      "/trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
-      "!dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
-      "/dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
-      "!validate": AuditAction.BOT_COMMAND_VALIDATE,
-      "/validate": AuditAction.BOT_COMMAND_VALIDATE,
-      "!balance": AuditAction.BOT_COMMAND_BALANCE,
-      "/balance": AuditAction.BOT_COMMAND_BALANCE,
-      "!swap": AuditAction.BOT_COMMAND_SWAP,
-      "/swap": AuditAction.BOT_COMMAND_SWAP,
-    };
-
-// Realtime
-router.use("/realtime", realtimeRoutes);
-
-    // Log to audit log
-    await auditLogService.log({
-      userId,
-      action: auditAction,
-      severity: success ? AuditSeverity.INFO : AuditSeverity.WARNING,
-      resource: `${platform}:${command}`,
-      metadata: {
-        platform,
-        command,
-        executionTimeMs,
-        timestamp,
-      },
-      errorMessage: error,
-      success,
-    });
-
-    // Also log to application logger for visibility
-    logger.info("Bot command performance metrics received", {
-      platform,
-      command,
-      userId,
-      executionTimeMs,
-      success,
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Metrics logged successfully",
-    });
-  } catch (error) {
-    logger.error("Error logging bot metrics", { error, body: req.body });
-    return res.status(500).json({
-      success: false,
-      message: "Failed to log metrics",
-    });
   }
-});
+);
 
 // #126: Bot session management endpoints
 const botSessionService = new BotSessionService();
 
 // Create or update a bot session
-router.post("/bot/session", async (req: Request, res: Response) => {
-  try {
-    const { userId, platform, sessionType, step, sessionData, expiresAt } =
-      req.body;
+router.post(
+  "/bot/session",
+  validateBody(CreateBotSessionDto),
+  async (req: Request, res: Response) => {
+    try {
+      const sessionDto = req.body as CreateBotSessionDto;
 
-    // Validate required fields
-    if (
-      !userId ||
-      !platform ||
-      !sessionType ||
-      step === undefined ||
-      !sessionData
-    ) {
-      return res.status(400).json({
+      // Set default expiration (24 hours from now) if not provided
+      const expiration = sessionDto.expiresAt
+        ? new Date(sessionDto.expiresAt)
+        : new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      const session = await botSessionService.create({
+        userId: sessionDto.userId,
+        platform: sessionDto.platform,
+        sessionType: sessionDto.sessionType,
+        step: sessionDto.step,
+        sessionData: sessionDto.sessionData,
+        expiresAt: expiration,
+      });
+
+      return res.status(200).json({
+        success: true,
+        session,
+      });
+    } catch (error) {
+      logger.error("Error creating bot session", { error, body: req.body });
+      return res.status(500).json({
         success: false,
-        message:
-          "Missing required fields: userId, platform, sessionType, step, sessionData",
+        message: "Failed to create session",
       });
     }
-
-    // Validate platform
-    if (!Object.values(BotPlatform).includes(platform)) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid platform. Must be one of: ${Object.values(BotPlatform).join(", ")}`,
-      });
-    }
-
-    // Validate session type
-    if (!Object.values(BotSessionType).includes(sessionType)) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid session type. Must be one of: ${Object.values(BotSessionType).join(", ")}`,
-      });
-    }
-
-    // Set default expiration (24 hours from now) if not provided
-    const expiration = expiresAt
-      ? new Date(expiresAt)
-      : new Date(Date.now() + 24 * 60 * 60 * 1000);
-
-    const session = await botSessionService.create({
-      userId,
-      platform,
-      sessionType,
-      step,
-      sessionData,
-      expiresAt: expiration,
-    });
-
-    return res.status(200).json({
-      success: true,
-      session,
-    });
-  } catch (error) {
-    logger.error("Error creating bot session", { error, body: req.body });
-    return res.status(500).json({
-      success: false,
-      message: "Failed to create session",
-    });
   }
-});
+);
 
 // Get active session for a user
-router.get("/bot/session", async (req: Request, res: Response) => {
-  try {
-    const { userId, platform, sessionType } = req.query;
+router.get(
+  "/bot/session",
+  validateQuery(QueryBotSessionDto),
+  async (req: Request, res: Response) => {
+    try {
+      const query = req.query as unknown as QueryBotSessionDto;
 
-    if (!userId || !platform || !sessionType) {
-      return res.status(400).json({
+      const session = await botSessionService.findActiveSession(
+        query.userId,
+        query.platform,
+        query.sessionType
+      );
+
+      if (!session) {
+        return res.status(404).json({
+          success: false,
+          message: "No active session found",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        session,
+      });
+    } catch (error) {
+      logger.error("Error getting bot session", { error, query: req.query });
+      return res.status(500).json({
         success: false,
-        message:
-          "Missing required query parameters: userId, platform, sessionType",
+        message: "Failed to get session",
       });
     }
-
-    const session = await botSessionService.findActiveSession(
-      userId as string,
-      platform as BotPlatform,
-      sessionType as BotSessionType
-    );
-
-    if (!session) {
-      return res.status(404).json({
-        success: false,
-        message: "No active session found",
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      session,
-    });
-  } catch (error) {
-    logger.error("Error getting bot session", { error, query: req.query });
-    return res.status(500).json({
-      success: false,
-      message: "Failed to get session",
-    });
   }
-});
+);
 
 // Update a bot session
-router.put("/bot/session/:sessionId", async (req: Request, res: Response) => {
-  try {
-    const { sessionId } = req.params;
-    const { step, sessionData, expiresAt, isActive } = req.body;
+router.put(
+  "/bot/session/:sessionId",
+  validateBody(UpdateBotSessionDto),
+  async (req: Request, res: Response) => {
+    try {
+      const { sessionId } = req.params;
+      const updateDto = req.body as UpdateBotSessionDto;
+      const isActive =
+        updateDto.isActive === "true" || updateDto.isActive === true;
 
-    const session = await botSessionService.update(sessionId, {
-      step,
-      sessionData,
-      expiresAt: expiresAt ? new Date(expiresAt) : undefined,
-      isActive,
-    });
+      const session = await botSessionService.update(sessionId, {
+        step: updateDto.step,
+        sessionData: updateDto.sessionData,
+        expiresAt: updateDto.expiresAt
+          ? new Date(updateDto.expiresAt)
+          : undefined,
+        isActive,
+      });
 
-    return res.status(200).json({
-      success: true,
-      session,
-    });
-  } catch (error) {
-    logger.error("Error updating bot session", {
-      error,
-      params: req.params,
-      body: req.body,
-    });
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update session",
-    });
+      return res.status(200).json({
+        success: true,
+        session,
+      });
+    } catch (error) {
+      logger.error("Error updating bot session", {
+        error,
+        params: req.params,
+        body: req.body,
+      });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update session",
+      });
+    }
   }
-});
+);
 
 // Deactivate a bot session
 router.delete(
@@ -387,7 +395,7 @@ router.delete(
 // Public webhook endpoint for Stellar funding notifications
 router.post(
   "/webhook/stellar/funding",
-  verifyWebhookSignature,
+  webhookAuth("stellar"),
   async (req: Request, res: Response) => {
     try {
       const result = await stellarWebhookService.processFundingWebhook(req);
@@ -415,10 +423,34 @@ router.post(
   }
 );
 
+type WebhookBody = Record<string, unknown> | undefined;
+
+/** Platform user that sent a Telegram update, used as the abuse-limit subject. */
+function telegramSenderId(body: WebhookBody): string | undefined {
+  const update = body as
+    | { message?: { from?: { id?: number } }; callback_query?: { from?: { id?: number } } }
+    | undefined;
+  const id = update?.message?.from?.id ?? update?.callback_query?.from?.id;
+  return id === undefined ? undefined : `telegram:${id}`;
+}
+
+/** Platform user that sent a Discord interaction, used as the abuse-limit subject. */
+function discordSenderId(body: WebhookBody): string | undefined {
+  const interaction = body as
+    | { member?: { user?: { id?: string } }; user?: { id?: string } }
+    | undefined;
+  const id = interaction?.member?.user?.id ?? interaction?.user?.id;
+  return id === undefined ? undefined : `discord:${id}`;
+}
+
 // Public webhook endpoint for Telegram
 router.post(
   "/webhook/telegram",
-  verifyWebhookSignature,
+  webhookAuth("telegram"),
+  createAbusePreventionMiddleware("webhook.telegram", undefined, {
+    surface: "bot",
+    subject: (req) => ({ userId: telegramSenderId(req.body) }),
+  }),
   async (req: Request, res: Response) => {
     try {
       const result = await platformWebhookService.processTelegramWebhook(req);
@@ -456,7 +488,11 @@ router.post(
 // Public webhook endpoint for Discord
 router.post(
   "/webhook/discord",
-  verifyWebhookSignature,
+  webhookAuth("discord"),
+  createAbusePreventionMiddleware("webhook.discord", undefined, {
+    surface: "bot",
+    subject: (req) => ({ userId: discordSenderId(req.body) }),
+  }),
   async (req: Request, res: Response) => {
     try {
       const result = await platformWebhookService.processDiscordWebhook(req);
@@ -501,27 +537,115 @@ router.post(
   }
 );
 
+router.post(
+  "/signup",
+  validateBody(SignupDto),
+  async (req: Request, res: Response) => {
+    try {
+      const signupDto = req.body as SignupDto;
+
+      const userRepository = AppDataSource.getRepository(User);
+
+      // Check for existing user (name is unique)
+      const existingUser = await userRepository.findOne({
+        where: { name: signupDto.name },
+      });
+
+      if (existingUser) {
+        return res.status(409).json({
+          success: false,
+          message: "User with this name already exists",
+        });
+      }
+
+      // Create user
+      const user = userRepository.create({
+        name: signupDto.name,
+        address: signupDto.address,
+        pk: signupDto.pk,
+        // isDeployed and tokenType will use defaults
+      });
+
+      // Save user
+      const savedUser = await userRepository.save(user);
+
+      // Log user creation
+      await auditLogService.log({
+        userId: savedUser.id,
+        action: AuditAction.USER_CREATED,
+        severity: AuditSeverity.INFO,
+        ipAddress:
+          (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+          (req.headers["x-real-ip"] as string) ||
+          req.socket.remoteAddress ||
+          "unknown",
+        userAgent: req.headers["user-agent"],
+        metadata: { username: signupDto.name, address: signupDto.address },
+      });
+
+      //  Return success
+      return res.status(201).json({
+        success: true,
+        userId: savedUser.id,
+      });
+    } catch (error) {
+      logger.error("Signup error", { error, name: req.body?.name });
+      return res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      });
+    }
+  }
+);
+
 /**
  * @swagger
- * /api/signup:
- *   post:
- *     summary: Register a new user with wallet details
- *     tags: [Auth]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - name
- *             properties:
- *               name:
- *                 type: string
- *                 description: Unique username
+ * /api/account/{userId}/transactions:
+ *   get:
+ *     summary: Get paginated Stellar transaction history
+ *     tags: [Transactions]
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID of the user
+ *       - in: query
+ *         name: type
+ *         schema:
+ *           type: string
+ *           enum: [funding, deployment, swap, transfer, all]
+ *         description: Filter by transaction type
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date filter (ISO 8601)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date filter (ISO 8601)
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *         description: Number of transactions per page
+ *       - in: query
+ *         name: cursor
+ *         schema:
+ *           type: string
+ *         description: Pagination cursor from previous response
  *     responses:
- *       201:
- *         description: User registered successfully
+ *       200:
+ *         description: Paginated transaction list
  *         content:
  *           application/json:
  *             schema:
@@ -529,18 +653,29 @@ router.post(
  *               properties:
  *                 success:
  *                   type: boolean
- *                   example: true
- *                 userId:
- *                   type: string
- *                   format: uuid
+ *                 transactions:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/TransactionHistoryItem'
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     nextCursor:
+ *                       type: string
+ *                     prevCursor:
+ *                       type: string
+ *                     limit:
+ *                       type: integer
+ *                     total:
+ *                       type: integer
  *       400:
- *         description: Missing required fields
+ *         description: Invalid query parameters
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/ErrorResponse'
- *       409:
- *         description: User with this name already exists
+ *       404:
+ *         description: User not found
  *         content:
  *           application/json:
  *             schema:
@@ -552,58 +687,111 @@ router.post(
  *             schema:
  *               $ref: '#/components/schemas/ErrorResponse'
  */
-router.post("/signup", async (req: Request, res: Response) => {
-  try {
-    const { name } = req.body;
+router.get(
+  "/account/:userId/transactions",
+  authenticateToken,
+  requireOwnerOrElevated("userId"),
+  validateQuery(TransactionQueryDto),
+  async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params;
 
-    if (!name) {
-      return res.status(400).json({
+      // Ensure userId is a string
+      if (!userId || Array.isArray(userId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid userId parameter",
+        });
+      }
+
+      // Extract validated query parameters
+      const query = req.query as unknown as TransactionQueryDto;
+
+      // Validate type parameter
+      const validTypes = ["funding", "deployment", "swap", "transfer", "all"];
+      if (query.type && !validTypes.includes(query.type)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid type. Must be one of: ${validTypes.join(", ")}`,
+        });
+      }
+
+      // Validate limit parameter
+      const parsedLimit = query.limit ? parseInt(query.limit, 10) : 20;
+      if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+        return res.status(400).json({
+          success: false,
+          message: "Limit must be a number between 1 and 100",
+        });
+      }
+
+      // Validate date parameters
+      if (query.startDate && isNaN(Date.parse(query.startDate))) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid startDate format. Use ISO 8601 format (e.g., 2024-01-01T00:00:00Z)",
+        });
+      }
+
+      if (query.endDate && isNaN(Date.parse(query.endDate))) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid endDate format. Use ISO 8601 format (e.g., 2024-01-01T00:00:00Z)",
+        });
+      }
+
+      // Build query parameters
+      const queryParams: TransactionQueryParams = {
+        type: query.type as TransactionType,
+        startDate: query.startDate,
+        endDate: query.endDate,
+        limit: parsedLimit,
+        cursor: query.cursor,
+      };
+
+      // Fetch transaction history
+      const result = await transactionHistoryService.getTransactionHistory(
+        userId,
+        queryParams
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...result,
+      });
+    } catch (error) {
+      console.error("Transaction history error:", error);
+      const message =
+        error instanceof Error ? error.message : "Internal server error";
+      const statusCode = message.includes("User not found") ? 404 : 500;
+
+      return res.status(statusCode).json({
         success: false,
-        message: "name is required",
+        message,
       });
     }
-
-    const userService = container.resolve(UserService);
-    const user = await userService.createUser({ name });
-
-    await auditLogService.log({
-      userId: user.id,
-      action: AuditAction.USER_CREATED,
-      severity: AuditSeverity.INFO,
-      ipAddress:
-        (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-        (req.headers["x-real-ip"] as string) ||
-        req.socket.remoteAddress ||
-        "unknown",
-      userAgent: req.headers["user-agent"],
-      metadata: { username: name, address: user.address },
-    });
-
-    return res.status(201).json({
-      success: true,
-      userId: user.id,
-    });
-  } catch (error) {
-    logger.error("Signup error", { error, name: req.body?.name });
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
   }
-});
+);
 
-// Liquidity
+// Liquidity pool endpoint
 router.post("/liquidity", async (req: Request, res: Response) => {
   try {
     const { assetCode, assetIssuer, depthLimit } = req.body;
+
     const result = await stellarLiquidityTool.execute({
       assetCode,
       assetIssuer,
       depthLimit,
     });
+
     res.json(result);
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : "An unknown error occurred";
+    // Check if it's a standard Error object
+    const errorMessage =
+      err instanceof Error ? err.message : "An unknown error occurred";
+
     res.status(500).json({ error: errorMessage });
   }
 });
@@ -661,7 +849,7 @@ router.get(
         message: "Failed to fetch job queue stats",
       });
     }
-  },
+  }
 );
 
 router.get(
@@ -684,7 +872,7 @@ router.get(
         message: "Failed to fetch dead-letter jobs",
       });
     }
-  },
+  }
 );
 
 // --- REAL-TIME UPDATES (Socket.io) ---
@@ -713,11 +901,6 @@ router.get(
  */
 router.get("/realtime/stats", (req: Request, res: Response) => {
   try {
-    // Dynamic import to avoid circular dependency issues
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getSocketManager: getManager } = require("./socketManager");
-    const socketManager = getManager();
-    const { getSocketManager } = require("./socketManager");
     const socketManager = getSocketManager();
 
     const stats = {
@@ -768,11 +951,6 @@ router.get("/realtime/stats", (req: Request, res: Response) => {
 router.get("/realtime/user/:userId/clients", (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    // Dynamic import to avoid circular dependency issues
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getSocketManager: getManager } = require("./socketManager");
-    const socketManager = getManager();
-    const { getSocketManager } = require("./socketManager");
     const socketManager = getSocketManager();
 
     const clients = socketManager.getUserClients(userId);
@@ -824,12 +1002,24 @@ router.post(
           .json({ success: false, message: "Account already sponsored" });
       }
 
-      const sponsorSecret = process.env.SPONSOR_SECRET_KEY;
-      if (!sponsorSecret) {
-        return res.status(503).json({
-          success: false,
-          message: "Sponsorship service not configured",
-        });
+      // Scoped, audited access: the plaintext seed only lives inside the
+      // callback and is zeroized afterwards.
+      let sponsorKeypair: StellarSdk.Keypair;
+      try {
+        sponsorKeypair = await secretManager.withSecret(
+          "stellar.sponsor-key",
+          { workflow: "sponsorship", actor: String(userId) },
+          (secret) => secret.consumeString((seed) => StellarSdk.Keypair.fromSecret(seed))
+        );
+      } catch (error) {
+        if (error instanceof SecretAccessError) {
+          logger.error("Sponsor key unavailable", { code: error.code });
+          return res.status(503).json({
+            success: false,
+            message: "Sponsorship service not configured",
+          });
+        }
+        throw error;
       }
 
       const networkPassphrase =
@@ -837,35 +1027,69 @@ router.post(
           ? StellarSdk.Networks.PUBLIC
           : StellarSdk.Networks.TESTNET;
 
-      const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecret);
+      const sponsorPublicKey = sponsorKeypair.publicKey();
       const server = new StellarSdk.Horizon.Server(
         process.env.HORIZON_URL || "https://horizon-testnet.stellar.org"
       );
 
-      await server.loadAccount(sponsorKeypair.publicKey());
-
-      const builder = new SponsorshipTransactionBuilder(
-        sponsorKeypair,
-        networkPassphrase
+      // Acquire a sequence lease for the sponsor account to prevent races
+      const sponsorLease = await sequenceLeaseService.acquireLease(
+        sponsorPublicKey,
+        `sponsor:${userId}`,
+        120_000,
+        server
       );
-      builder.addBeginSponsorship({
-        sponsor: sponsorKeypair.publicKey(),
-        sponsoredAccount: user.address,
+
+      // Build account with leased sequence to prevent races across instances
+      const sponsorAccount = new StellarSdk.Account(
+        sponsorPublicKey,
+        sponsorLease.sequenceNumber.toString()
+      );
+
+      const txBuilder = new StellarSdk.TransactionBuilder(sponsorAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase,
       });
-      // Create the sponsored account entry
-      builder.addSponsoredOperation(
+      txBuilder.addOperation(
+        StellarSdk.Operation.beginSponsoringFutureReserves({
+          source: sponsorPublicKey,
+          sponsored: user.address,
+        })
+      );
+      txBuilder.addOperation(
         StellarSdk.Operation.createAccount({
-          source: sponsorKeypair.publicKey(),
+          source: sponsorPublicKey,
           destination: user.address,
           startingBalance: "0",
         })
       );
-      builder.addEndSponsorship();
+      txBuilder.addOperation(
+        StellarSdk.Operation.endSponsoringFutureReserves({
+          source: user.address,
+        })
+      );
 
-      const tx = builder.build();
+      const tx = txBuilder.setTimeout(300).build();
       tx.sign(sponsorKeypair);
 
+      // Validate lease fencing before submission
+      await sequenceLeaseService.validateLease(
+        sponsorLease.lease.id,
+        sponsorLease.fencingToken
+      );
+
       await server.submitTransaction(tx);
+
+      // Mark lease consumed after successful submission
+      const txResult = await server
+        .transactions()
+        .transaction(tx.hash)
+        .call();
+      await sequenceLeaseService.consumeLease(
+        sponsorLease.lease.id,
+        `sponsor:${userId}`,
+        txResult.hash
+      );
 
       user.isFunded = true;
       user.updatedAt = new Date();
@@ -922,10 +1146,15 @@ router.get(
       const userRepository = AppDataSource.getRepository(User);
       const user = await userRepository.findOne({ where: { id: userId } });
       if (!user) {
-        return res.status(404).json({ success: false, message: "User not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
       }
 
-      const summary = await portfolioService.getPortfolio(user.address, currency);
+      const summary = await portfolioService.getPortfolio(
+        user.address,
+        currency
+      );
 
       await auditLogService.log({
         userId,
@@ -941,45 +1170,69 @@ router.get(
         address: summary.address,
         currency: summary.currency,
         totalValue: summary.totalValue,
+        // Gross deposits vs balances the protocol lets the account withdraw (#853).
+        withdrawable: summary.withdrawable,
         assets: summary.assets.map((a) => ({
           code: a.code,
           issuer: a.issuer,
           balance: a.amount,
           value: a.valueInCurrency,
+          withdrawable: a.withdrawableAmount,
+          locked: a.lockedAmount,
+          lockedReasons: a.lockedReasons,
         })),
         fetchedAt: summary.fetchedAt,
       });
     } catch (error) {
-      logger.error("Portfolio fetch error", { error, userId: req.params.userId });
-      const message = error instanceof Error ? error.message : "Internal server error";
+      logger.error("Portfolio fetch error", {
+        error,
+        userId: req.params.userId,
+      });
+      const message =
+        error instanceof Error ? error.message : "Internal server error";
       const statusCode =
-        message.includes("not found") || message.includes("unreachable") ? 404 : 500;
+        message.includes("not found") || message.includes("unreachable")
+          ? 404
+          : 500;
       return res.status(statusCode).json({ success: false, message });
     }
   }
 );
 
 /**
- * GET /api/price/:assetCode?currency=USD
+ * GET /api/price/:assetCode?currency=USD&issuer=G...
  *
  * Returns the current DEX price of an asset in the requested currency.
  * Used by the bot's price-alert polling loop and the !portfolio command.
+ *
+ * `issuer` is optional. When supplied, the price is only returned for that
+ * issuer's asset, so a price for one `USDC` issuer is never served for
+ * another; the resolved issuer comes back in the response.
  */
 router.get("/price/:assetCode", async (req: Request, res: Response) => {
   try {
     const { assetCode } = req.params;
     const currency = (req.query.currency as string | undefined) ?? "USD";
+    const issuer = (req.query.issuer as string | undefined) ?? undefined;
 
-    const result = await portfolioService.getAssetPrice(assetCode, currency);
+    const result = await portfolioService.getAssetPrice(
+      assetCode,
+      currency,
+      issuer
+    );
 
     return res.status(200).json({
       success: true,
       assetCode: result.assetCode,
       currency: result.currency,
       price: result.price,
+      ...(result.assetIssuer ? { issuer: result.assetIssuer } : {}),
     });
   } catch (error) {
-    logger.error("Price fetch error", { error, assetCode: req.params.assetCode });
+    logger.error("Price fetch error", {
+      error,
+      assetCode: req.params.assetCode,
+    });
     return res.status(500).json({
       success: false,
       message: error instanceof Error ? error.message : "Internal server error",

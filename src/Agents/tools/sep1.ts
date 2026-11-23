@@ -1,6 +1,13 @@
 import { BaseTool } from "./base/BaseTool";
 import { ToolMetadata, ToolResult } from "../registry/ToolMetadata";
 import logger from "../../config/logger";
+import { secureFetch } from "../../Security/egress";
+import {
+  createBudget,
+  BudgetExhaustedError,
+  withBudget,
+  type RequestBudget,
+} from "../../utils/budget";
 
 /**
  * SEP-1 Stellar.toml metadata structure
@@ -66,9 +73,10 @@ interface AssetMetadataPayload extends Record<string, unknown> {
   domain?: string;
 }
 
+/**
+ * Tool for retrieving and parsing stellar.toml metadata (SEP-1) to provide token information
+ */
 export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
-  private fetch: typeof globalThis.fetch;
-
   metadata: ToolMetadata = {
     name: "sep1_tool",
     description:
@@ -100,11 +108,25 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
     ],
     category: "metadata",
     version: "1.0.0",
+    // SEP-1 fetches arbitrary user-supplied domains by design, so the
+    // egress manifest allows all public FQDNs over HTTPS. The egress layer
+    // still blocks loopback/link-local/private/metadata/mixed-encoding
+    // addresses, defends against DNS rebinding, and re-validates redirects.
+    egress: {
+      allowedHosts: ["*"],
+      allowedProtocols: ["https:", "http:"],
+      maxConcurrentRequests: 4,
+      budget: { timeLimitMs: 15_000, maxRedirects: 3 },
+    },
   };
 
+  /**
+   * Initialize the SEP-1 tool. Outbound requests route through the egress
+   * layer (loopback/private/metadata/IPv6 denial, DNS rebinding defence,
+   * redirect re-validation).
+   */
   constructor() {
     super();
-    this.fetch = globalThis.fetch.bind(globalThis);
   }
 
   private readonly domainPattern =
@@ -112,6 +134,19 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
   private readonly assetPattern =
     /^[A-Z0-9]{1,12}:[GABCDEF0-9]{10,56}$/i;
 
+  private readonly tomlBudget: RequestBudget = createBudget({
+    path: "sep1.fetchStellarToml",
+    deadlineMs: 10000,
+    attempts: 2,
+    bytes: 256 * 1024,
+    downstreamCalls: 3,
+  });
+
+  /**
+   * Execute a SEP-1 operation
+   * @param payload - The operation payload with operation type and query parameters
+   * @returns ToolResult with stellar.toml metadata
+   */
   async execute(payload: AssetMetadataPayload): Promise<ToolResult> {
     try {
       switch (payload.operation) {
@@ -139,7 +174,9 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
   }
 
   /**
-   * Get asset metadata by resolving the issuing domain from the asset issuer
+   * Get metadata for a specific asset by resolving the issuing domain and fetching stellar.toml
+   * @param payload - Payload with asset in CODE:ISSUER format
+   * @returns ToolResult with asset metadata
    */
   private async getAssetMetadata(
     payload: AssetMetadataPayload
@@ -252,6 +289,8 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
 
   /**
    * Get all metadata from a domain's stellar.toml
+   * @param payload - Payload with the domain name
+   * @returns ToolResult with full stellar.toml contents
    */
   private async getDomainMetadata(
     payload: AssetMetadataPayload
@@ -305,7 +344,9 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
   }
 
   /**
-   * List all assets from a domain's stellar.toml
+   * List all assets defined in a domain's stellar.toml
+   * @param payload - Payload with optional domain (defaults to stellar.org)
+   * @returns ToolResult with list of assets
    */
   private async listAssets(payload: AssetMetadataPayload): Promise<ToolResult> {
     const domain = (payload.domain || "stellar.org").toLowerCase();
@@ -348,6 +389,8 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
 
   /**
    * Fetch and parse stellar.toml from a domain
+   * @param domain - The domain to fetch stellar.toml from
+   * @returns Parsed StellarToml object or null on failure
    */
   private async fetchStellarToml(domain: string): Promise<StellarToml | null> {
     try {
@@ -360,20 +403,38 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
         ? `https://${domain}/stellar.toml`
         : `https://${domain}/.well-known/stellar.toml`;
 
-      const response = await this.fetch(url, {
-        headers: {
-          Accept: "text/plain",
-        },
-      });
+      const response = await withBudget(
+        this.tomlBudget,
+        () =>
+          secureFetch(
+            url,
+            {
+              headers: {
+                Accept: "text/plain",
+              },
+            },
+            { egress: this.metadata.egress }
+          ),
+        { resource: "downstreamCalls" }
+      );
 
       if (!response.ok) {
         // Try alternative path
         const altUrl = `https://${domain}/stellar.toml`;
-        const altResponse = await this.fetch(altUrl, {
-          headers: {
-            Accept: "text/plain",
-          },
-        });
+        const altResponse = await withBudget(
+          this.tomlBudget,
+          () =>
+            secureFetch(
+              altUrl,
+              {
+                headers: {
+                  Accept: "text/plain",
+                },
+              },
+              { egress: this.metadata.egress }
+            ),
+          { resource: "downstreamCalls" }
+        );
 
         if (!altResponse.ok) {
           logger.warn(
@@ -389,13 +450,22 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
       const text = await response.text();
       return this.parseToml(text);
     } catch (error) {
+      if (error instanceof BudgetExhaustedError) {
+        logger.error(
+          `SEP-1 budget exhausted fetching stellar.toml from ${domain}:`,
+          { resource: error.resource }
+        );
+        return null;
+      }
       logger.error(`Error fetching stellar.toml from ${domain}:`, error);
       return null;
     }
   }
 
   /**
-   * Parse TOML content into an object (simple parser for stellar.toml)
+   * Parse TOML content into a StellarToml object (simple parser for stellar.toml format)
+   * @param content - Raw TOML string content
+   * @returns Parsed StellarToml object
    */
   private parseToml(content: string): StellarToml {
     const result: StellarToml = {
@@ -518,13 +588,19 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
     return result;
   }
 
+  /**
+   * Validate a domain name format
+   * @param domain - The domain string to validate
+   * @returns Whether the domain is valid
+   */
   private isValidDomain(domain: string): boolean {
     return this.domainPattern.test(domain) && !domain.includes("..");
   }
 
   /**
-   * Try to resolve issuer domain from Horizon (simplified - in production use getKeyValue)
-   * This is a placeholder - actual implementation would need Horizon API integration
+   * Resolve the domain associated with a Stellar asset issuer
+   * @param issuer - The issuer public key
+   * @returns The resolved domain or null if unknown
    */
   private async resolveIssuerDomain(issuer: string): Promise<string | null> {
     // Common domain mappings for known issuers

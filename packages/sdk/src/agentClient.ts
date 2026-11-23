@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "crypto";
-import { 
-  AgentResponse, 
-  ChainId, 
+import {
+  AgentResponse,
+  ChainId,
   CrossChainSwapRequest,
   RequestOptions,
   SimulationRequest,
@@ -12,6 +12,15 @@ import {
   VaultOperationResult,
   AbortSignalLike,
 } from "./types";
+import {
+  abortableSleep,
+  combineSignals,
+  isAbortError,
+  throwIfAborted,
+} from "./abort";
+import { ErrorCategory, SdkError } from "./errors";
+import { ErrorRegistry, SdkErrorCode } from "./errorRegistry";
+import { HTTP_STATUS_TO_SDK_CODE } from "./errorMapping";
 
 export interface IdempotencyKeyInput {
   namespace: string;
@@ -25,11 +34,6 @@ export interface AgentClientOptions {
   defaultMaxRetries?: number;
   defaultRetryDelayMs?: number;
   fetchFn?: FetchLike;
-}
-
-interface AbortControllerLike {
-  signal: AbortSignalLike;
-  abort: () => void;
 }
 
 export interface AgentQueryRequest {
@@ -48,7 +52,7 @@ export interface AgentQueryResult<T = AgentResponse> {
   result: T;
 }
 
-export class AgentRequestError extends Error {
+export class AgentRequestError extends SdkError {
   readonly idempotencyKey: string;
   readonly attempts: number;
   readonly statusCode?: number;
@@ -57,23 +61,59 @@ export class AgentRequestError extends Error {
     message: string,
     idempotencyKey: string,
     attempts: number,
-    statusCode?: number,
+    statusCode?: number
   ) {
-    const category = statusCode !== undefined
-      ? categorizeHttpStatus(statusCode)
-      : ErrorCategory.TRANSPORT;
-    const code = statusCode !== undefined
-      ? `HTTP_${statusCode}`
-      : "AGENT_REQUEST_FAILED";
-    const recoverable = statusCode !== undefined
-      ? RETRIABLE_STATUS_CODES.has(statusCode)
-      : false;
+    // Resolve a *registered* SDK code rather than inventing `HTTP_<status>` /
+    // `AGENT_REQUEST_FAILED` strings that no consumer can switch on. The code
+    // comes from the public backend→SDK mapping contract (#1047).
+    const code = agentErrorCodeForStatus(statusCode);
+    const def = ErrorRegistry.require(code);
 
-    super({ category, code, message, recoverable });
+    super({
+      category: def.category,
+      code: def.code,
+      message,
+      recoverable: def.recoverable,
+      details: {
+        attempts,
+        ...(statusCode !== undefined ? { httpStatus: statusCode } : {}),
+      },
+    });
     this.name = "AgentRequestError";
     this.idempotencyKey = idempotencyKey;
     this.attempts = attempts;
     this.statusCode = statusCode;
+  }
+}
+
+/**
+ * Raised when the agent returns a 2xx response whose body is not valid JSON.
+ *
+ * Carries the registered `AGENT_BAD_RESPONSE` code and is never retried: a
+ * malformed body will not become well-formed on a subsequent attempt.
+ */
+export class AgentBadResponseError extends SdkError {
+  readonly idempotencyKey: string;
+  readonly attempts: number;
+
+  constructor(
+    message: string,
+    idempotencyKey: string,
+    attempts: number,
+    cause?: unknown
+  ) {
+    const def = ErrorRegistry.require("AGENT_BAD_RESPONSE");
+    super({
+      category: def.category,
+      code: def.code,
+      message,
+      recoverable: false,
+      details: { attempts },
+      cause,
+    });
+    this.name = "AgentBadResponseError";
+    this.idempotencyKey = idempotencyKey;
+    this.attempts = attempts;
   }
 }
 
@@ -100,16 +140,33 @@ type FetchLike = (
 
 const RETRIABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-function categorizeHttpStatus(status: number): ErrorCategory {
+/**
+ * Maps an HTTP status code to a top-level error category.
+ *
+ * This is the public, consumer-visible mapping from a backend transport
+ * failure to an {@link ErrorCategory}. Keep it in sync with the backend error
+ * contract (`docs/PLATFORM_VALIDATION_CONTRACTS.md`); the error-mapping
+ * contract test enumerates the statuses this must handle.
+ */
+export function categorizeHttpStatus(status: number): ErrorCategory {
   if (status === 429) return ErrorCategory.POLICY;
-  if (status === 422 || status === 400) return ErrorCategory.VALIDATION;
+  if (status === 400 || status === 422) return ErrorCategory.VALIDATION;
   if (status === 401 || status === 403) return ErrorCategory.POLICY;
   if (status >= 500) return ErrorCategory.EXECUTION;
   return ErrorCategory.TRANSPORT;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Pick the registered {@link SdkErrorCode} for an agent HTTP failure.
+ *
+ * Always returns a code present in {@link ErrorRegistry}. A 401 specifically
+ * maps to `AGENT_SESSION_EXPIRED` (the agent session must be refreshed) rather
+ * than the generic `UNAUTHORIZED`, since agent calls carry a session token.
+ */
+export function agentErrorCodeForStatus(status?: number): SdkErrorCode {
+  if (status === undefined) return "TRANSPORT_ERROR";
+  if (status === 401) return "AGENT_SESSION_EXPIRED";
+  return HTTP_STATUS_TO_SDK_CODE[status] ?? "TRANSPORT_ERROR";
 }
 
 function canonicalize(value: unknown): unknown {
@@ -154,7 +211,6 @@ export function createBtcToStellarSwapIdempotencyKey(
     clientRequestId,
   });
 }
-
 function toSwapQuery(request: CrossChainSwapRequest): string {
   return [
     `Swap ${request.amount} ${request.fromToken}`,
@@ -162,29 +218,6 @@ function toSwapQuery(request: CrossChainSwapRequest): string {
     `to ${request.toToken} on ${request.toChain}`,
     `for destination ${request.destinationAddress}`,
   ].join(" ");
-}
-
-function createTimedSignal(
-  timeoutMs: number,
-  externalSignal?: AbortSignalLike
-) {
-  const controller = new AbortController() as unknown as AbortControllerLike;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  if (externalSignal) {
-    if (externalSignal.aborted) {
-      controller.abort();
-    } else {
-      externalSignal.addEventListener?.("abort", () => controller.abort(), {
-        once: true,
-      });
-    }
-  }
-
-  return {
-    signal: controller.signal,
-    clear: () => clearTimeout(timeoutId),
-  };
 }
 
 export class AgentClient {
@@ -212,6 +245,10 @@ export class AgentClient {
   async query<T = AgentResponse>(
     request: AgentQueryRequest
   ): Promise<AgentQueryResult<T>> {
+    // Fail fast (and identically to every other public method) when the caller
+    // has already cancelled: no fetch is dispatched, no retry backoff runs.
+    throwIfAborted(request.signal);
+
     const idempotencyKey =
       request.idempotencyKey ??
       generateIdempotencyKey({
@@ -227,17 +264,12 @@ export class AgentClient {
     const retryDelayMs = request.retryDelayMs ?? this.defaultRetryDelayMs;
 
     let attempts = 0;
-    let lastCategorizedError: CategorizedError = {
-      category: "TRANSPORT",
-      code: "UNKNOWN",
-      message: "Request failed",
-      recoverable: false,
-    };
+    let lastErrorMessage = "Request failed";
     let lastStatusCode: number | undefined;
 
     while (attempts < maxRetries) {
       attempts += 1;
-      const timedSignal = createTimedSignal(timeoutMs, request.signal);
+      const timed = combineSignals(timeoutMs, request.signal);
 
       try {
         const response = await this.fetchFn(`${this.baseUrl}/query`, {
@@ -250,80 +282,101 @@ export class AgentClient {
             userId: request.userId,
             query: request.query,
           }),
-          signal: timedSignal.signal,
+          signal: timed.signal as AbortSignalLike,
         });
 
         if (!response.ok) {
           lastStatusCode = response.status;
           const body = await response.text().catch(() => "");
-          lastCategorizedError = parseCategorizedError(body, response.status);
+          const message = body || `HTTP ${response.status}`;
 
           if (
             !RETRIABLE_STATUS_CODES.has(response.status) ||
             attempts >= maxRetries
           ) {
             throw new AgentRequestError(
-              `Agent query failed: ${lastCategorizedError.message}`,
+              `Agent query failed: ${message}`,
               idempotencyKey,
               attempts,
-              response.status,
+              response.status
             );
           }
 
-          await sleep(retryDelayMs * attempts);
+          lastErrorMessage = `Agent query failed: ${message}`;
+          await abortableSleep(
+            retryDelayMs * attempts,
+            timed.signal as AbortSignalLike
+          );
           continue;
         }
 
-        const parsed = (await response.json()) as QueryEnvelope<T>;
+        let parsed: QueryEnvelope<T>;
+        try {
+          parsed = (await response.json()) as QueryEnvelope<T>;
+        } catch (parseError) {
+          // A 2xx with an unparseable body is a contract violation by the
+          // agent, not a transient network failure: surface AGENT_BAD_RESPONSE
+          // immediately instead of retrying.
+          const def = ErrorRegistry.require("AGENT_BAD_RESPONSE");
+          throw new AgentBadResponseError(
+            def.message,
+            idempotencyKey,
+            attempts,
+            parseError
+          );
+        }
+
         return {
           idempotencyKey,
           attempts,
           result: parsed.result,
         };
       } catch (error) {
-        if (error instanceof AgentRequestError) {
-          throw error;
-        }
-
-        const isAbort =
-          error instanceof Error &&
-          (error.name === "AbortError" || error.message.includes("aborted"));
         const isNetwork =
           error instanceof TypeError ||
           (error instanceof Error &&
             error.message.toLowerCase().includes("network"));
 
-        lastCategorizedError = {
-          category: isAbort
-            ? "TRANSPORT"
-            : isNetwork
-              ? "TRANSPORT"
-              : "UNKNOWN",
-          code: isAbort ? "REQUEST_ABORTED" : isNetwork ? "NETWORK_ERROR" : "UNKNOWN",
-          message: error instanceof Error ? error.message : String(error),
-          recoverable: isNetwork || isAbort,
-        };
+        if (
+          error instanceof AgentRequestError ||
+          error instanceof AgentBadResponseError
+        ) {
+          throw error;
+        }
 
-        if (!(isAbort || isNetwork) || attempts >= maxRetries) {
+        // Caller-initiated cancellation (or a timeout) must propagate as an
+        // abort error, never be wrapped in AgentRequestError or retried. This
+        // keeps the abort contract identical across every public SDK method.
+        if (isAbortError(error)) {
+          throw error;
+        }
+
+        lastErrorMessage =
+          error instanceof Error ? error.message : String(error);
+
+        if (!isNetwork || attempts >= maxRetries) {
           throw new AgentRequestError(
-            `Agent query failed: ${lastCategorizedError.message}`,
+            `Agent query failed: ${lastErrorMessage}`,
             idempotencyKey,
             attempts,
-            lastStatusCode,
+            lastStatusCode
           );
         }
 
-        await sleep(retryDelayMs * attempts);
+        await abortableSleep(
+          retryDelayMs * attempts,
+          timed.signal as AbortSignalLike
+        );
       } finally {
-        timedSignal.clear();
+        timed.cleanup();
       }
     }
 
     throw new AgentRequestError(
-      `Agent query failed: ${lastCategorizedError.message}`,
+      `Agent query failed: ${lastErrorMessage}`,
       idempotencyKey,
       attempts,
-      lastStatusCode,
+      lastStatusCode
     );
   }
 
@@ -401,16 +454,9 @@ export class AgentClient {
       swapRequest.fromChain !== ChainId.BITCOIN ||
       swapRequest.toChain !== ChainId.STELLAR
     ) {
-      throw new SdkError({
-        category: ErrorCategory.VALIDATION,
-        code: "INVALID_SWAP_DIRECTION",
-        message:
-          "executeBtcToStellarSwap only supports fromChain=bitcoin and toChain=stellar",
-        details: {
-          fromChain: swapRequest.fromChain,
-          toChain: swapRequest.toChain,
-        },
-      });
+      throw new Error(
+        "executeBtcToStellarSwap only supports fromChain=bitcoin and toChain=stellar"
+      );
     }
 
     const idempotencyKey =

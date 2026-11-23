@@ -41,9 +41,12 @@ export {
   SdkInitError,
   SimulationError,
   SimulationErrorResponse,
+  ContractError,
+  parseHostError,
   AuthRequiredError,
   DecodeError,
   SigningError,
+  NetworkMismatchError,
   InvocationError,
 } from "./soroban/errors";
 

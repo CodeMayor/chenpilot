@@ -6,24 +6,30 @@ import { container } from "tsyringe";
 import swaggerUi from "swagger-ui-express";
 import routes from "./routes";
 import authRoutes from "./auth.routes";
-import promptRoutes from "./promptRoutes";
+import assetRoutes from "./asset.routes";
 import { swaggerSpec } from "./swagger";
 import requestLogger from "../middleware/requestLogger";
 import {
   createAbusePreventionMiddleware,
+  defaultAbusePreventionService,
   ipBlacklistMiddleware,
   ipBlacklistRoutes,
 } from "../Security";
 
 import { observabilityMiddleware, updateObservabilityContext } from "../observability";
+import { setTenantContext, setOptionalTenantContext } from "../Auth/tenantContext.middleware";
 
-import { authenticate } from "../Auth/auth";
 import UserService from "../Auth/user.service";
+import { unifiedAuthorizer } from "../Security/authorization/channelAdapters";
+import { principalForRole } from "../Security/authorization/operationCatalog";
 import { validateQuery } from "../Agents/validationService";
 import { intentAgent } from "../Agents/agents/intentagent";
 import { ErrorHandler } from "./middleware/errorHandler";
 import { UnauthorizedError, ValidationError, BadError } from "../utils/error";
 import { healthService } from "../services/healthService";
+import { rawBodyCapture } from "./middleware/rawBodyCapture.middleware";
+import { inboundPolicyMiddleware } from "./middleware/inboundPolicy.middleware";
+import config from "../config/config";
 
 declare module "express" {
   interface Request {
@@ -45,15 +51,33 @@ app.use("/settings", express.static(path.join(__dirname, "../../public")));
 app.use(helmet());
 
 // CORS configuration
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : "*";
+
 app.use(
   cors({
-    origin: process.env.ALLOWED_ORIGINS || "*",
+    origin: allowedOrigins,
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
   })
 );
 
-app.use(express.json());
+// Inbound size policy enforcement (JSON, webhook, attachment, and endpoint gaps)
+// Early-rejects oversized requests and tracks exhaustion in BudgetManager
+app.use(inboundPolicyMiddleware);
+
+// CRITICAL: Raw body capture MUST come before express.json()
+// This preserves original request bytes for webhook signature verification
+app.use(rawBodyCapture);
+
+// Express JSON parsing configured with max attachment limit so endpoint-specific gaps
+// and large attachments can be parsed, with tight limits enforced by inboundPolicyMiddleware
+app.use(
+  express.json({
+    limit: config.inbound?.attachmentLimit || "25mb",
+  })
+);
 app.use(observabilityMiddleware);
 app.use(requestLogger);
 app.use(ipBlacklistMiddleware);
@@ -73,8 +97,30 @@ app.post("/query", sensitiveLimiter, async (req, res, next) => {
       component: "http.query",
     });
 
-    const user = await authenticate(userId);
-    if (!user) throw new UnauthorizedError("invalid credentials");
+    const user = userId ? await container.resolve(UserService).getUserById(userId) : null;
+    if (!user) {
+      // clientIP is set by sensitiveLimiter above.
+      defaultAbusePreventionService.recordFailure(
+        {
+          surface: "api",
+          action: "query",
+          subject: { ipAddress: (req as { clientIP?: string }).clientIP },
+        },
+        "auth_failed"
+      );
+      throw new UnauthorizedError("invalid credentials");
+    }
+
+    const authz = await unifiedAuthorizer.authorize({
+      operation: "agent:query",
+      channel: "http",
+      principal: principalForRole(user.id, user.role),
+      resource: "POST /query",
+    });
+    if (!authz.allowed) {
+      res.status(403).json({ success: false, code: authz.reason, decisionId: authz.decisionId });
+      return;
+    }
 
     const valid = await validateQuery(query, userId);
     if (!valid) throw new ValidationError("invalid query");
@@ -88,6 +134,8 @@ app.post("/query", sensitiveLimiter, async (req, res, next) => {
 
 // Mount all API routes under /api prefix
 app.use("/api", routes);
+app.use("/api/assets", assetRoutes);
+app.use("/api/security/blacklist", ipBlacklistRoutes);
 app.use("/api/prompts", promptRoutes);
 app.use("/api/security/blacklist", ipBlacklistRoutes);
 

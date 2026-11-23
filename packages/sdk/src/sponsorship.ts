@@ -1,5 +1,6 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { AssetToTrust, TrustlineWorkflowBuilder } from "./trustline";
+import { isAmount, isPositiveAmount } from "./advancedOps/validation";
 
 export type SponsorshipOperation = "begin" | "end";
 
@@ -34,7 +35,7 @@ export interface SponsorshipWorkflowConfig {
 }
 
 export interface SponsorshipWorkflowPreview {
-  operations: StellarSdk.Operation<any>[];
+  operations: any[];
   transactionXdr: string;
   sponsor: string;
   sponsoredAccount: string;
@@ -58,7 +59,7 @@ export interface SponsorshipWorkflowResourceEstimate {
 export interface SponsorshipWorkflowResult {
   transactionXdr: string;
   signedTransactionXdr?: string;
-  operations: StellarSdk.Operation<any>[];
+  operations: any[];
   resourceEstimate: SponsorshipWorkflowResourceEstimate;
 }
 
@@ -93,13 +94,13 @@ export class SponsorshipTransactionBuilder {
       /**
        * Timebounds for the transaction
        */
-      timebounds?: StellarSdk.Timebounds;
+      timebounds?: any;
     }
   ) {
     this.source = source;
     this.networkPassphrase = networkPassphrase;
 
-    this.builder = new StellarSdk.TransactionBuilder({
+    this.builder = new (StellarSdk.TransactionBuilder as any)({
       source: source.publicKey(),
       fee: options?.fee || 100,
       timebounds: options?.timebounds || {
@@ -123,7 +124,7 @@ export class SponsorshipTransactionBuilder {
   addBeginSponsorship(config: SponsorshipConfig): this {
     this.sponsorshipConfig = config;
 
-    const operation = StellarSdk.Operation.beginSponsoringFutureReserves({
+    const operation = (StellarSdk.Operation as any).beginSponsoringFutureReserves({
       source: config.sponsor,
       sponsored: config.sponsoredAccount,
     });
@@ -169,18 +170,18 @@ export class SponsorshipTransactionBuilder {
    */
   addRevokeSponsorship(entry: {
     type: "ledger_key" | "claimable_balance";
-    ledgerKey?: StellarSdk.LedgerKey;
+    ledgerKey?: any;
     claimableBalanceId?: string;
   }): this {
-    let revokeEntry: StellarSdk.RevokeSponsorshipOp;
+    let revokeEntry: any;
 
     if (entry.type === "ledger_key" && entry.ledgerKey) {
-      revokeEntry = StellarSdk.Operation.revokeSponsorship({
+      revokeEntry = (StellarSdk.Operation as any).revokeSponsorship({
         source: this.source.publicKey(),
         ledgerKey: entry.ledgerKey,
       });
     } else if (entry.type === "claimable_balance" && entry.claimableBalanceId) {
-      revokeEntry = StellarSdk.Operation.revokeSponsorship({
+      revokeEntry = (StellarSdk.Operation as any).revokeSponsorship({
         source: this.source.publicKey(),
         claimableBalanceId: entry.claimableBalanceId,
       });
@@ -202,7 +203,7 @@ export class SponsorshipTransactionBuilder {
    * @param operation - The operation to add
    * @returns this builder for chaining
    */
-  addSponsoredOperation(operation: StellarSdk.Operation<any>): this {
+  addSponsoredOperation(operation: any): this {
     this.builder.addOperation(operation);
 
     return this;
@@ -213,7 +214,7 @@ export class SponsorshipTransactionBuilder {
    *
    * @param destination - Destination account address
    * @param asset - Asset to send (default: XLM)
-   * @param amount - Amount to send
+   * @param amount - Amount to send (must be a valid decimal string)
    * @returns this builder for chaining
    */
   addSponsoredPayment(
@@ -221,6 +222,10 @@ export class SponsorshipTransactionBuilder {
     asset: StellarSdk.Asset = StellarSdk.Asset.native(),
     amount: string
   ): this {
+    if (!isAmount(amount)) {
+      throw new Error(`Invalid amount "${amount}": must be a non-negative decimal string with at most 7 decimal places`);
+    }
+
     const operation = StellarSdk.Operation.payment({
       source: this.sponsorshipConfig?.sponsoredAccount,
       destination,
@@ -296,7 +301,7 @@ export class SponsorshipTransactionBuilder {
    * @returns this builder for chaining
    */
   setFee(fee: number): this {
-    this.builder.fee = fee;
+    (this.builder as any).fee = fee;
     return this;
   }
 
@@ -306,8 +311,8 @@ export class SponsorshipTransactionBuilder {
    * @param timebounds - Timebounds object
    * @returns this builder for chaining
    */
-  setTimebounds(timebounds: StellarSdk.Timebounds): this {
-    this.builder.timebounds = timebounds;
+  setTimebounds(timebounds: any): this {
+    (this.builder as any).timebounds = timebounds;
     return this;
   }
 
@@ -401,9 +406,9 @@ export class SponsorshipWorkflowBuilder {
     this.config = {
       horizonUrl: config.horizonUrl || "https://horizon.stellar.org",
       networkPassphrase: config.networkPassphrase || StellarSdk.Networks.PUBLIC,
-      sponsorSecret: config.sponsorSecret,
-      sponsor: config.sponsor,
-      sponsoredAccount: config.sponsoredAccount,
+      sponsorSecret: config.sponsorSecret ?? "",
+      sponsor: config.sponsor ?? "",
+      sponsoredAccount: config.sponsoredAccount ?? "",
     };
   }
 
@@ -438,6 +443,9 @@ export class SponsorshipWorkflowBuilder {
   }
 
   addPayment(destination: string, amount: string, asset?: StellarSdk.Asset): this {
+    if (!isAmount(amount)) {
+      throw new Error(`Invalid amount "${amount}": must be a non-negative decimal string with at most 7 decimal places`);
+    }
     this.payments.push({ destination, amount, asset });
     this.step = SponsorshipWorkflowStep.BUILDING;
     return this;
@@ -446,13 +454,14 @@ export class SponsorshipWorkflowBuilder {
   async preview(): Promise<SponsorshipWorkflowPreview> {
     this.step = SponsorshipWorkflowStep.PREVIEWING;
 
-    const operations: StellarSdk.Operation<any>[] = [];
+    const operations: any[] = [];
 
     if (this.config.sponsor && this.config.sponsoredAccount) {
       operations.push(
-        StellarSdk.Operation.beginSponsoringFutureReserves({
+        (StellarSdk.Operation as any).beginSponsoringFutureReserves({
           sponsor: this.config.sponsor,
-          sponsored: this.config.sponsoredAccount,
+          // stellar-sdk expects the `sponsoredId` field name
+          sponsoredId: this.config.sponsoredAccount,
         })
       );
     }
@@ -516,7 +525,7 @@ export class SponsorshipWorkflowBuilder {
         }
       );
       operations.forEach((op) => tx.addOperation(op));
-      transactionXdr = tx.build().toXDR();
+      transactionXdr = tx.setTimeout(30).build().toXDR();
     }
 
     return {

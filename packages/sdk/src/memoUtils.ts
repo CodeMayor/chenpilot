@@ -3,8 +3,7 @@
  * Provides simplified utilities for building and validating Hash and Return memo types.
  */
 
-// @ts-ignore: dependency is provided at the workspace root
-import { Memo } from "stellar-sdk";
+import { Memo } from "@stellar/stellar-sdk";
 
 /**
  * Represents a memo value with its type
@@ -96,7 +95,11 @@ export function buildReturnMemo(input: Buffer | string | Uint8Array): Memo {
   }
 
   isValidMemoHash(buffer);
-  return Memo.return(buffer);
+  // The Stellar SDK types only expose the string overload for `Memo.return`,
+  // but its runtime (and the `Memo` constructor) also accepts a Buffer, which
+  // is what callers expect `memo.value` to be. Cast through the constructor
+  // overload instead of stringifying, which would change the memo's value.
+  return Memo.return(buffer as unknown as string);
 }
 
 /**

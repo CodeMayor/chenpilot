@@ -12,6 +12,7 @@ export interface Asset {
 
 export interface AssetData {
   metadata?: AssetMetadata;
+  metadataRevisionId?: string;
   price?: PriceInfo;
   trust?: TrustScore;
   compatibility?: CompatibilityMap;
@@ -27,6 +28,20 @@ export interface AssetMetadata {
   isAuthRequired?: boolean;
   authRevoked?: boolean;
   tomlUrl?: string;
+  provenance?: MetadataProvenance[];
+}
+
+export interface MetadataProvenance {
+  provider: 'horizon' | 'stellar_toml';
+  url: string;
+  fetchedAt: number;
+}
+
+export interface MetadataRevision {
+  revisionId: string; // content hash of asset + metadata
+  asset: Asset;
+  metadata: AssetMetadata;
+  recordedAt: number;
 }
 
 export interface PriceInfo {
@@ -38,8 +53,13 @@ export interface PriceInfo {
   timestamp: number;
 }
 
+export type PriceResult =
+  | { status: 'available'; price: PriceInfo }
+  | { status: 'unavailable'; reason: 'no_configured_source' | 'provider_unavailable' };
+
 export interface TrustScore {
   overall: number; // 0-100
+  confidence: number; // 0-100, proportion of configured signal weight observed fresh
   signals: TrustSignal[];
   verificationStatus: 'verified' | 'unverified' | 'malicious';
   lastUpdated: number;
@@ -47,7 +67,8 @@ export interface TrustScore {
 
 export interface TrustSignal {
   type: string;
-  value: number;
+  value: number | null;
+  status: 'known' | 'unknown';
   weight: number;
   description: string;
   source: string;
