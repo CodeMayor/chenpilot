@@ -56,3 +56,42 @@ export function toDecimalString(d: FixedDecimal): string {
   const fracPart = d.scale === 0 ? "" : digits.slice(digits.length - d.scale);
   return `${negative ? "-" : ""}${intPart}${fracPart ? `.${fracPart}` : ""}`;
 }
+
+export type RoundingMode = "half_even" | "half_up" | "down";
+
+/**
+ * Round to `scale` fractional digits.
+ *  - half_even: ties go to the even neighbour (banker's rounding)
+ *  - half_up:   ties go away from zero
+ *  - down:      truncate toward zero
+ * Negative values round symmetrically (by magnitude).
+ */
+export function roundToScale(d: FixedDecimal, scale: number, mode: RoundingMode): FixedDecimal {
+  if (d.scale <= scale) return upscale(d, scale);
+
+  const divisor = 10n ** BigInt(d.scale - scale);
+  const negative = d.units < 0n;
+  const magnitude = negative ? -d.units : d.units;
+  let quotient = magnitude / divisor;
+  const remainder = magnitude % divisor;
+
+  if (mode !== "down" && remainder !== 0n) {
+    const twice = remainder * 2n;
+    if (twice > divisor) quotient += 1n;
+    else if (twice === divisor) {
+      if (mode === "half_up" || quotient % 2n === 1n) quotient += 1n;
+    }
+  }
+
+  return { units: negative ? -quotient : quotient, scale };
+}
+
+/** Convert a JS number to a decimal (12 fractional digits; rounding noise beyond that is dropped). */
+export function numberToDecimal(n: number): FixedDecimal | null {
+  if (!Number.isFinite(n) || Math.abs(n) >= 1e21) return null;
+  return parseDecimal(n.toFixed(12));
+}
+
+export function subtract(a: FixedDecimal, b: FixedDecimal): FixedDecimal {
+  return add(a, { units: -b.units, scale: b.scale });
+}
