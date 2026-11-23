@@ -2,6 +2,7 @@ import logger from "../config/logger";
 import { QueueJob } from "./job.entity";
 import { JobQueueService, jobQueueService } from "./jobQueue.service";
 import { propagateJobContext } from "../observability/jobContext";
+import { decideRetry, getRetryBudget, type RetryBudget } from "./retryBudget";
 import {
   AuthenticatedActor,
   authorizeJobOperation,
@@ -36,7 +37,9 @@ export interface JobWorkerOptions {
   pollIntervalMs?: number;
   leaseMs?: number;
   concurrency?: number;
+  /** Override the per-job-class budget's backoff base (#1066). */
   retryBaseDelayMs?: number;
+  /** Override the per-job-class budget's backoff cap (#1066). */
   retryMaxDelayMs?: number;
   /**
    * How long `stop()` waits for in-flight handlers before handing their jobs
@@ -108,8 +111,8 @@ export class JobWorker {
   private readonly pollIntervalMs: number;
   private readonly leaseMs: number;
   private readonly concurrency: number;
-  private readonly retryBaseDelayMs: number;
-  private readonly retryMaxDelayMs: number;
+  private readonly retryBaseDelayMs?: number;
+  private readonly retryMaxDelayMs?: number;
   private readonly shutdownDeadlineMs: number;
   private running = false;
   private loops: Promise<void>[] = [];
@@ -126,8 +129,8 @@ export class JobWorker {
     this.pollIntervalMs = options.pollIntervalMs ?? 3000;
     this.leaseMs = options.leaseMs ?? 30000;
     this.concurrency = options.concurrency ?? 2;
-    this.retryBaseDelayMs = options.retryBaseDelayMs ?? 5000;
-    this.retryMaxDelayMs = options.retryMaxDelayMs ?? 300000;
+    this.retryBaseDelayMs = options.retryBaseDelayMs;
+    this.retryMaxDelayMs = options.retryMaxDelayMs;
     this.shutdownDeadlineMs = resolveShutdownDeadline(options.shutdownDeadlineMs);
   }
 
@@ -388,18 +391,14 @@ export class JobWorker {
           });
           return;
         case "retry": {
-          const retryDelayMs = result.delayMs ?? this.computeRetryDelay(job.attempts);
-          const retryAt = new Date(Date.now() + retryDelayMs);
-          const retryResult = await this.queueService.failJob(
+          const retryResult = await this.retryOrExhaust(
             job,
-            this.options.workerId,
             result.error ?? "Handler requested retry",
-            retryAt,
+            result.delayMs,
           );
-          logger.warn("Job retry scheduled", {
+          logger.warn("Job retry requested", {
             jobId: job.id,
             jobType: job.jobType,
-            retryAt,
             retryResult,
           });
           return;
@@ -435,13 +434,7 @@ export class JobWorker {
         return;
       }
 
-      const retryAt = new Date(Date.now() + this.computeRetryDelay(job.attempts));
-      const retryResult = await this.queueService.failJob(
-        job,
-        this.options.workerId,
-        message,
-        retryAt,
-      );
+      const retryResult = await this.retryOrExhaust(job, message);
       logger.warn("Job handler threw error", {
         jobId: job.id,
         jobType: job.jobType,
@@ -454,8 +447,53 @@ export class JobWorker {
     }
   }
 
-  private computeRetryDelay(attempts: number): number {
-    const exponential = this.retryBaseDelayMs * 2 ** attempts;
-    return Math.min(exponential, this.retryMaxDelayMs);
+  /** Budget for a job class, with any worker-level backoff overrides applied. */
+  private budgetFor(jobType: string): RetryBudget {
+    const budget = getRetryBudget(jobType);
+    return {
+      ...budget,
+      baseDelayMs: this.retryBaseDelayMs ?? budget.baseDelayMs,
+      maxDelayMs: this.retryMaxDelayMs ?? budget.maxDelayMs,
+    };
+  }
+
+  /**
+   * Retry a failed attempt only while its job class's retry budget allows
+   * (#1066). Cancelled jobs are never retried; exhausted jobs are dead-lettered
+   * with the budget recorded for operators.
+   */
+  private async retryOrExhaust(
+    job: QueueJob,
+    errorMessage: string,
+    requestedDelayMs?: number,
+  ): Promise<"retried" | "dead_letter" | "lost_lease" | "cancelled" | "budget_exhausted"> {
+    const fresh = await this.queueService.getJob(job.id);
+    if (!fresh || fresh.status === "cancelled") {
+      logger.info("Job cancelled during execution — not retrying", { jobId: job.id });
+      return "cancelled";
+    }
+
+    const decision = decideRetry(job, this.budgetFor(job.jobType), new Date(), requestedDelayMs);
+    if (!decision.retry) {
+      const exhausted = await this.queueService.exhaustRetryBudget(job, this.options.workerId, errorMessage, {
+        reason: decision.reason,
+        attempts: decision.attempts,
+        elapsedMs: decision.elapsedMs,
+        maxAttempts: decision.budget.maxAttempts,
+        maxElapsedMs: decision.budget.maxElapsedMs,
+      });
+      if (!exhausted) return "lost_lease";
+      logger.error("Job retry budget exhausted — moved to dead letter", {
+        jobId: job.id,
+        jobType: job.jobType,
+        reason: decision.reason,
+        attempts: decision.attempts,
+        elapsedMs: decision.elapsedMs,
+        error: errorMessage,
+      });
+      return "budget_exhausted";
+    }
+
+    return this.queueService.failJob(job, this.options.workerId, errorMessage, decision.retryAt);
   }
 }

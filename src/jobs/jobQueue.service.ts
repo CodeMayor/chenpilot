@@ -5,6 +5,7 @@ import { QueueJob } from "./job.entity";
 import { getExecutionContext } from "../observability/context";
 import { evaluateJobAbusePolicy } from "../Security/abusePrevention/channelGuards";
 import { AbuseEvaluationResult } from "../Security/abusePrevention/types";
+import { getRetryBudget, type RetryBudgetExhaustion } from "./retryBudget";
 
 /** Thrown when a user schedules background work faster than the abuse policy allows. */
 export class JobThrottledError extends Error {
@@ -73,7 +74,7 @@ export class JobQueueService {
       correlationId: input.correlationId,
       metadata: input.metadata,
       availableAt: input.availableAt ?? new Date(),
-      maxAttempts: input.maxAttempts ?? 5,
+      maxAttempts: input.maxAttempts ?? getRetryBudget(input.jobType).maxAttempts,
       status: "pending",
     });
 
@@ -290,6 +291,45 @@ export class JobQueueService {
     }
 
     return shouldDeadLetter ? "dead_letter" : "retried";
+  }
+
+  /**
+   * Dead-letter a job whose retry budget is spent (#1066), recording the
+   * budget in `metadata.retryBudget` so operators can see why it stopped.
+   */
+  async exhaustRetryBudget(
+    job: QueueJob,
+    workerId: string,
+    errorMessage: string,
+    details: {
+      reason: RetryBudgetExhaustion;
+      attempts: number;
+      elapsedMs: number;
+      maxAttempts: number;
+      maxElapsedMs: number;
+    },
+  ): Promise<boolean> {
+    const result = await this.repository
+      .createQueryBuilder()
+      .update(QueueJob)
+      .set({
+        status: "dead_letter",
+        attempts: details.attempts,
+        lastError: errorMessage,
+        leaseExpiresAt: null,
+        leasedBy: null,
+        deadLetteredAt: () => "NOW()",
+        metadata: {
+          ...(job.metadata ?? {}),
+          retryBudget: { ...details, exhaustedAt: new Date().toISOString() },
+        },
+      })
+      .where("id = :jobId", { jobId: job.id })
+      .andWhere("status = 'leased'")
+      .andWhere("leasedBy = :workerId", { workerId })
+      .execute();
+
+    return (result.affected ?? 0) > 0;
   }
 
   async deadLetterJob(
