@@ -23,7 +23,11 @@ export interface JobHandler {
    * the handler runs, exactly as if the user invoked it directly.
    */
   operation?: string;
-  handle(job: QueueJob): Promise<JobHandlerResult | void>;
+  /**
+   * `signal` aborts when a graceful shutdown deadline expires (#1069); the job
+   * has then been handed back to the queue and this handler's result is ignored.
+   */
+  handle(job: QueueJob, signal?: AbortSignal): Promise<JobHandlerResult | void>;
 }
 
 export interface JobWorkerOptions {
@@ -34,6 +38,11 @@ export interface JobWorkerOptions {
   concurrency?: number;
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
+  /**
+   * How long `stop()` waits for in-flight handlers before handing their jobs
+   * back to the queue (#1069). Default 25s, or JOB_SHUTDOWN_DEADLINE_MS.
+   */
+  shutdownDeadlineMs?: number;
   /** Re-reads a job's originating user (role, suspension) at execution time. */
   resolveJobActor?: (userId: string) => Promise<AuthenticatedActor | undefined>;
 }
@@ -69,6 +78,31 @@ function sleep(ms: number): Promise<void> {
 
 export class NonRetryableJobError extends Error {}
 
+export interface ActiveJobHandler {
+  jobId: string;
+  jobType: string;
+  slot: number;
+  startedAt: Date;
+}
+
+export interface ShutdownReport {
+  /** True when every in-flight handler finished before the deadline. */
+  drained: boolean;
+  deadlineMs: number;
+  /** Jobs whose handlers were still running at the deadline and were returned to the queue. */
+  released: string[];
+  /** Jobs that could not be released (lease already lost); their lease will simply expire. */
+  releaseFailed: string[];
+}
+
+const DEFAULT_SHUTDOWN_DEADLINE_MS = 25_000;
+
+function resolveShutdownDeadline(explicit?: number): number {
+  if (explicit !== undefined) return Math.max(0, explicit);
+  const fromEnv = Number(process.env.JOB_SHUTDOWN_DEADLINE_MS);
+  return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : DEFAULT_SHUTDOWN_DEADLINE_MS;
+}
+
 export class JobWorker {
   private readonly handlers = new Map<string, JobHandler>();
   private readonly pollIntervalMs: number;
@@ -76,8 +110,14 @@ export class JobWorker {
   private readonly concurrency: number;
   private readonly retryBaseDelayMs: number;
   private readonly retryMaxDelayMs: number;
+  private readonly shutdownDeadlineMs: number;
   private running = false;
   private loops: Promise<void>[] = [];
+  private stopping: Promise<ShutdownReport> | null = null;
+  private readonly active = new Map<
+    string,
+    ActiveJobHandler & { controller: AbortController; abandoned: boolean }
+  >();
 
   constructor(
     private readonly queueService: JobQueueService = jobQueueService,
@@ -88,6 +128,21 @@ export class JobWorker {
     this.concurrency = options.concurrency ?? 2;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 5000;
     this.retryMaxDelayMs = options.retryMaxDelayMs ?? 300000;
+    this.shutdownDeadlineMs = resolveShutdownDeadline(options.shutdownDeadlineMs);
+  }
+
+  /** Handlers currently executing on this worker. */
+  getActiveHandlers(): ActiveJobHandler[] {
+    return [...this.active.values()].map(({ jobId, jobType, slot, startedAt }) => ({
+      jobId,
+      jobType,
+      slot,
+      startedAt,
+    }));
+  }
+
+  isRunning(): boolean {
+    return this.running;
   }
 
   registerHandler(handler: JobHandler): void {
@@ -111,15 +166,72 @@ export class JobWorker {
     });
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Graceful stop (#1069): stop leasing new jobs immediately, wait up to the
+   * deadline for in-flight handlers, then hand any still-running jobs back to
+   * the queue (no attempt consumed) and abort their signals. Idempotent.
+   */
+  async stop(deadlineMs: number = this.shutdownDeadlineMs): Promise<ShutdownReport> {
+    if (this.stopping) return this.stopping;
     if (!this.running) {
-      return;
+      return { drained: true, deadlineMs, released: [], releaseFailed: [] };
     }
 
     this.running = false;
-    await Promise.all(this.loops);
+    this.stopping = this.drain(deadlineMs).finally(() => {
+      this.stopping = null;
+    });
+    return this.stopping;
+  }
+
+  private async drain(deadlineMs: number): Promise<ShutdownReport> {
+    logger.info("Job worker draining", {
+      workerId: this.options.workerId,
+      activeHandlers: this.active.size,
+      deadlineMs,
+    });
+
+    let timer: NodeJS.Timeout | undefined;
+    const loopsDone = Promise.all(this.loops).then(() => true);
+    const deadline = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), deadlineMs);
+    });
+    const drained = await Promise.race([loopsDone, deadline]);
+    clearTimeout(timer);
+
+    const released: string[] = [];
+    const releaseFailed: string[] = [];
+
+    if (!drained) {
+      for (const entry of this.active.values()) {
+        entry.abandoned = true;
+        entry.controller.abort(new Error("worker shutdown deadline exceeded"));
+        try {
+          const ok = await this.queueService.releaseJob(
+            entry.jobId,
+            this.options.workerId,
+            `Interrupted by worker shutdown after ${deadlineMs}ms`,
+          );
+          (ok ? released : releaseFailed).push(entry.jobId);
+        } catch (error) {
+          releaseFailed.push(entry.jobId);
+          logger.error("Failed to release job on shutdown", {
+            jobId: entry.jobId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      logger.warn("Job worker shutdown deadline expired", {
+        workerId: this.options.workerId,
+        deadlineMs,
+        released,
+        releaseFailed,
+      });
+    }
+
     this.loops = [];
-    logger.info("Job worker stopped", { workerId: this.options.workerId });
+    logger.info("Job worker stopped", { workerId: this.options.workerId, drained });
+    return { drained, deadlineMs, released, releaseFailed };
   }
 
   private async runLoop(slot: number): Promise<void> {
@@ -215,6 +327,17 @@ export class JobWorker {
       }
     }
 
+    const controller = new AbortController();
+    const tracked = {
+      jobId: job.id,
+      jobType: job.jobType,
+      slot,
+      startedAt: new Date(),
+      controller,
+      abandoned: false,
+    };
+    this.active.set(job.id, tracked);
+
     const keepAlive = setInterval(() => {
       void this.queueService
         .renewLease(job.id, this.options.workerId, this.leaseMs)
@@ -235,7 +358,16 @@ export class JobWorker {
     }, Math.max(1000, Math.floor(this.leaseMs / 2)));
 
     try {
-      const result = await propagateJobContext(job, async () => (await handler.handle(job)) ?? { outcome: "completed" as const });
+      const result = await propagateJobContext(
+        job,
+        async () => (await handler.handle(job, controller.signal)) ?? { outcome: "completed" as const },
+      );
+
+      if (tracked.abandoned) {
+        // Shutdown already handed this job back to the queue.
+        logger.warn("Ignoring result of job released during shutdown", { jobId: job.id });
+        return;
+      }
 
       switch (result.outcome) {
         case "completed":
@@ -288,6 +420,11 @@ export class JobWorker {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
+      if (tracked.abandoned) {
+        logger.warn("Ignoring failure of job released during shutdown", { jobId: job.id, error: message });
+        return;
+      }
+
       if (error instanceof NonRetryableJobError) {
         await this.queueService.deadLetterJob(job.id, this.options.workerId, message);
         logger.error("Job failed permanently", {
@@ -313,6 +450,7 @@ export class JobWorker {
       });
     } finally {
       clearInterval(keepAlive);
+      this.active.delete(job.id);
     }
   }
 

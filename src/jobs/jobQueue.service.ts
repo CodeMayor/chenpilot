@@ -213,6 +213,42 @@ export class JobQueueService {
     return true;
   }
 
+  /**
+   * Hand a leased job back to the queue without spending an attempt (#1069).
+   * Used when a graceful shutdown deadline expires while the handler is still
+   * running: the work stays pending and another worker picks it up. Guarded by
+   * `leasedBy`, so the abandoned handler can no longer complete or fail it.
+   */
+  async releaseJob(jobId: string, workerId: string, reason: string): Promise<boolean> {
+    const job = await this.getJob(jobId);
+    if (!job || job.status !== "leased" || job.leasedBy !== workerId) {
+      return false;
+    }
+
+    const result = await this.repository
+      .createQueryBuilder()
+      .update(QueueJob)
+      .set({
+        status: "pending",
+        availableAt: () => "NOW()",
+        leaseExpiresAt: null,
+        leasedBy: null,
+        lastError: reason,
+        metadata: {
+          ...(job.metadata ?? {}),
+          interruptedAt: new Date().toISOString(),
+          interruptedBy: workerId,
+          interruptReason: reason,
+        },
+      })
+      .where("id = :jobId", { jobId })
+      .andWhere("status = 'leased'")
+      .andWhere("leasedBy = :workerId", { workerId })
+      .execute();
+
+    return (result.affected ?? 0) > 0;
+  }
+
   async failJob(
     job: QueueJob,
     workerId: string,
