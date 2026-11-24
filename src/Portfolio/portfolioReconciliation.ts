@@ -17,7 +17,9 @@
  *
  * Public API
  * ──────────
- * `buildPortfolioReconciliationView(report)` — the single entry point.
+ * `buildPortfolioReconciliationView(report, valuations?)` — the single entry point.
+ * Pass valuations from `valueHoldings()` (assetValuation.ts) to include a
+ * per-asset valuation status and reason (#1101).
  * All other exports are the types that make up the view.
  */
 
@@ -27,6 +29,8 @@ import {
   DriftSeverity,
 } from "../services/reconciliation.service";
 import { InvariantResult } from "../services/invariantEngine";
+import type { AssetValuation, ValuationStatus } from "./assetValuation";
+import { add, parseDecimal, toDecimalString, type FixedDecimal } from "./fixedDecimal";
 
 // ── Presentation types ────────────────────────────────────────────────────────
 
@@ -100,6 +104,11 @@ export interface PortfolioReconciliationView {
    * then by entityId for stable ordering.
    */
   discrepancies: BalanceDiscrepancy[];
+  /**
+   * Per-asset valuation with a structured status and reason (#1101). Present
+   * only when valuations were supplied to the builder.
+   */
+  valuation?: ReconciliationValuation;
   /** Aggregate counts for quick summary display. */
   summary: {
     total: number;
@@ -110,6 +119,40 @@ export interface PortfolioReconciliationView {
     lagRelated: number;
     /** Number of discrepancies with a safe repair hint. */
     withRepairHint: number;
+  };
+}
+
+export interface ReconciliationValuation {
+  currency: string;
+  assets: AssetValuation[];
+  /** Sum of `priced` and `zero_balance` values only (exact decimal string). */
+  valuedTotal: string;
+  /** False when any asset's value is unknown; the total then understates holdings. */
+  complete: boolean;
+  /** Count of assets per valuation status. */
+  byStatus: Record<ValuationStatus, number>;
+}
+
+function summarizeValuations(assets: AssetValuation[], currency: string): ReconciliationValuation {
+  const byStatus: Record<ValuationStatus, number> = {
+    priced: 0,
+    zero_balance: 0,
+    unsupported_asset: 0,
+    quote_unavailable: 0,
+    malformed_price: 0,
+  };
+  let total: FixedDecimal = { units: 0n, scale: 0 };
+  for (const asset of assets) {
+    byStatus[asset.status]++;
+    const value = asset.value === null ? null : parseDecimal(asset.value);
+    if (value) total = add(total, value);
+  }
+  return {
+    currency,
+    assets,
+    valuedTotal: toDecimalString(total),
+    complete: byStatus.unsupported_asset + byStatus.quote_unavailable + byStatus.malformed_price === 0,
+    byStatus,
   };
 }
 
@@ -257,6 +300,7 @@ function mergeInvariantResult(
  */
 export function buildPortfolioReconciliationView(
   report: ReconciliationReport,
+  valuations?: { currency: string; assets: AssetValuation[] },
 ): PortfolioReconciliationView {
   // Build a lookup from invariant ID → InvariantResult for O(1) merge
   const invariantById = new Map<string, InvariantResult>();
@@ -298,6 +342,7 @@ export function buildPortfolioReconciliationView(
     status: report.status,
     errorMessage: report.errorMessage,
     discrepancies,
+    ...(valuations ? { valuation: summarizeValuations(valuations.assets, valuations.currency) } : {}),
     summary: {
       total: discrepancies.length,
       critical: discrepancies.filter((d) => d.severity === "critical").length,

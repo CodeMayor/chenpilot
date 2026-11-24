@@ -3,6 +3,21 @@ import { getRedisClient } from "../redis/client";
 import logger from "../../config/logger";
 import { LockOptions, LockResult, LockInfo, LockService } from "./types";
 
+/** Thrown when a protected write carries a fencing token older than the latest issued (#1070). */
+export class StaleFencingTokenError extends Error {
+  constructor(
+    public readonly resourceKey: string,
+    public readonly fencingToken: number,
+    public readonly currentToken: number | null
+  ) {
+    super(
+      `Stale fencing token ${fencingToken} for ${resourceKey} (current ${currentToken ?? "none"}); ` +
+        "the lock expired and a newer holder acquired it"
+    );
+    this.name = "StaleFencingTokenError";
+  }
+}
+
 interface InstrumentationCounters {
   acquireSuccess: number;
   acquireFailure: number;
@@ -39,6 +54,47 @@ export class RedisLockService implements LockService {
   private extractOwnerId(lockValue: string): string {
     const colonIndex = lockValue.indexOf(":");
     return colonIndex === -1 ? lockValue : lockValue.substring(0, colonIndex);
+  }
+
+  /** Never expires, so tokens keep increasing across lock lifetimes. */
+  private getFenceKey(resourceKey: string): string {
+    return `lock:fence:${resourceKey}`;
+  }
+
+  /** SET NX PX and, only on success, issue the next fencing token atomically. */
+  private acquireLuaScript(): string {
+    return `
+      if redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX') then
+        return redis.call('INCR', KEYS[2])
+      end
+      return 0
+    `;
+  }
+
+  /** Returns 1 if ARGV[1] is the latest issued token, else 0. */
+  private validateFenceLuaScript(): string {
+    return `
+      local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+      if tonumber(ARGV[1]) == current then
+        return 1
+      end
+      return 0
+    `;
+  }
+
+  /**
+   * Fenced write to a Redis key: applies SET only if ARGV[1] is the latest
+   * token, atomically with the check. Returns 1 if written, 0 if stale.
+   */
+  private fencedSetLuaScript(): string {
+    return `
+      local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+      if tonumber(ARGV[1]) ~= current then
+        return 0
+      end
+      redis.call('SET', KEYS[2], ARGV[2])
+      return 1
+    `;
   }
 
   private releaseLuaScript(): string {
@@ -89,7 +145,6 @@ export class RedisLockService implements LockService {
 
     const lockKey = this.getLockKey(resourceKey);
     const lockValue = this.generateLockValue(identifier);
-    const ttlSeconds = Math.ceil(ttl / 1000);
     const startTime = Date.now();
 
     logger.debug("Attempting to acquire lock", {
@@ -102,15 +157,25 @@ export class RedisLockService implements LockService {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const redis = getRedisClient();
-        const result = await redis.set(lockKey, lockValue, "EX", ttlSeconds, "NX");
+        const token = Number(
+          await redis.eval(
+            this.acquireLuaScript(),
+            2,
+            lockKey,
+            this.getFenceKey(resourceKey),
+            lockValue,
+            ttl
+          )
+        );
 
-        if (result === "OK") {
+        if (token > 0) {
           const acquiredAt = Date.now();
           this.counters.acquireSuccess++;
 
           logger.info("Lock acquired successfully", {
             resourceKey,
             identifier,
+            fencingToken: token,
             attempt,
             ttl,
             acquireMs: acquiredAt - startTime,
@@ -122,6 +187,7 @@ export class RedisLockService implements LockService {
             lockValue,
             ttl,
             acquiredAt,
+            fencingToken: token,
           };
         }
 
@@ -397,6 +463,79 @@ export class RedisLockService implements LockService {
       extendFailure: 0,
       forceRelease: 0,
     };
+  }
+
+  // ─── Fencing (#1070) ────────────────────────────────────────────────────────
+
+  /** True if `fencingToken` is still the latest token issued for the resource. */
+  async isFencingTokenCurrent(resourceKey: string, fencingToken: number): Promise<boolean> {
+    const redis = getRedisClient();
+    const result = await redis.eval(
+      this.validateFenceLuaScript(),
+      1,
+      this.getFenceKey(resourceKey),
+      fencingToken
+    );
+    return Number(result) === 1;
+  }
+
+  /** Latest token issued for the resource, or null if it was never locked. */
+  async getCurrentFencingToken(resourceKey: string): Promise<number | null> {
+    const value = await getRedisClient().get(this.getFenceKey(resourceKey));
+    return value === null ? null : Number(value);
+  }
+
+  /** Throw StaleFencingTokenError unless `fencingToken` is the latest issued. */
+  async assertFencingToken(resourceKey: string, fencingToken: number): Promise<void> {
+    if (!(await this.isFencingTokenCurrent(resourceKey, fencingToken))) {
+      const current = await this.getCurrentFencingToken(resourceKey);
+      logger.warn("Rejected write with stale fencing token", {
+        resourceKey,
+        fencingToken,
+        currentToken: current,
+      });
+      throw new StaleFencingTokenError(resourceKey, fencingToken, current);
+    }
+  }
+
+  /**
+   * Run a protected write only if the caller still holds the latest token.
+   * The token is passed to `write` so downstream stores can persist/compare it.
+   * For non-Redis side effects this check narrows but cannot close the race;
+   * prefer storing the token with the write (see fencedSet) where possible.
+   */
+  async runFenced<T>(
+    resourceKey: string,
+    fencingToken: number,
+    write: (fencingToken: number) => Promise<T>
+  ): Promise<T> {
+    await this.assertFencingToken(resourceKey, fencingToken);
+    return write(fencingToken);
+  }
+
+  /** Atomic fenced write of a Redis value: stale tokens never commit. */
+  async fencedSet(
+    resourceKey: string,
+    fencingToken: number,
+    dataKey: string,
+    value: string
+  ): Promise<void> {
+    const redis = getRedisClient();
+    const written = await redis.eval(
+      this.fencedSetLuaScript(),
+      2,
+      this.getFenceKey(resourceKey),
+      dataKey,
+      fencingToken,
+      value
+    );
+    if (Number(written) !== 1) {
+      throw new StaleFencingTokenError(
+        resourceKey,
+        fencingToken,
+        await this.getCurrentFencingToken(resourceKey)
+      );
+    }
   }
 
   private delay(ms: number): Promise<void> {

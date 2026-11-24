@@ -15,35 +15,89 @@ export interface RecipientRevision {
   version: number;
   status: RecipientRevisionStatus;
   createdAt: string;
+  /** Who created this address version (#1104). */
+  createdBy: string;
   verifiedAt?: string;
+  verifiedBy?: string;
   supersededAt?: string;
+  supersededBy?: string;
+}
+
+/** One entry per address change, newest last (#1104). */
+export interface RecipientAddressChange {
+  recipientId: string;
+  fromVersion: number | null;
+  toVersion: number;
+  fromAddress: string | null;
+  toAddress: string;
+  network: string;
+  actor: string;
+  changedAt: string;
+  /** Verification status of the new version at the time of the change. */
+  verificationStatus: RecipientRevisionStatus;
+}
+
+/** Thrown when a transfer approval no longer matches the recipient's current verified address version. */
+export class StaleRecipientApprovalError extends Error {
+  constructor(
+    message: string,
+    public readonly approvedVersion: number,
+    public readonly currentVersion: number
+  ) {
+    super(message);
+    this.name = "StaleRecipientApprovalError";
+  }
 }
 
 export interface PreparedTransfer {
   transferId: string;
   recipientId: string;
   approvedRevisionId: string;
+  /** Address version the approval was granted for; any later change invalidates it. */
+  approvedVersion: number;
   approvalHash: string;
 }
 
 export class RecipientGovernanceService {
   private readonly revisions = new Map<string, RecipientRevision[]>();
+  private readonly changes = new Map<string, RecipientAddressChange[]>();
 
   createRecipient(input: { recipientId: string; identityKey: string; address: string; network: string }, now = new Date()): RecipientRevision {
     this.assertNoDuplicateIdentity(input.network, input.address, input.recipientId);
     const revision = this.revision(input, 1, "pending_verification", now);
     this.revisions.set(input.recipientId, [revision]);
-    return revision;
-  }
-
-  verifyRevision(recipientId: string, revisionId: string, now = new Date()): RecipientRevision {
-    const revision = this.mustFind(recipientId, revisionId);
-    revision.status = "verified";
-    revision.verifiedAt = now.toISOString();
+    this.changes.set(input.recipientId, [
+      {
+        recipientId: input.recipientId,
+        fromVersion: null,
+        toVersion: 1,
+        fromAddress: null,
+        toAddress: input.address,
+        network: input.network,
+        actor,
+        changedAt: now.toISOString(),
+        verificationStatus: revision.status,
+      },
+    ]);
     return { ...revision };
   }
 
-  updateRecipient(input: { recipientId: string; address: string; network: string }, now = new Date()): RecipientRevision {
+  verifyRevision(recipientId: string, revisionId: string, now = new Date(), actor = "system"): RecipientRevision {
+    const revision = this.mustFind(recipientId, revisionId);
+    if (revision.status === "superseded") {
+      throw new Error("Cannot verify a superseded recipient address version");
+    }
+    revision.status = "verified";
+    revision.verifiedAt = now.toISOString();
+    revision.verifiedBy = actor;
+    return { ...revision };
+  }
+
+  updateRecipient(
+    input: { recipientId: string; address: string; network: string; actor?: string },
+    now = new Date()
+  ): RecipientRevision {
+    const actor = input.actor ?? "system";
     const history = this.revisions.get(input.recipientId);
     if (!history?.length) {
       throw new Error(`Unknown recipient: ${input.recipientId}`);
@@ -61,13 +115,26 @@ export class RecipientGovernanceService {
 
     current.status = "superseded";
     current.supersededAt = now.toISOString();
+    current.supersededBy = actor;
     const next = this.revision(
-      { ...input, identityKey: current.identityKey },
+      { recipientId: input.recipientId, address: input.address, network: input.network, identityKey: current.identityKey },
       current.version + 1,
       "pending_verification",
       now,
+      actor,
     );
     history.push(next);
+    this.changes.get(input.recipientId)?.push({
+      recipientId: input.recipientId,
+      fromVersion: current.version,
+      toVersion: next.version,
+      fromAddress: current.address,
+      toAddress: next.address,
+      network: next.network,
+      actor,
+      changedAt: now.toISOString(),
+      verificationStatus: next.status,
+    });
     return { ...next };
   }
 
@@ -78,15 +145,53 @@ export class RecipientGovernanceService {
     }
 
     const approvalHash = crypto.createHash("sha256").update(JSON.stringify({ ...input, address: revision.address, network: revision.network })).digest("hex");
-    return { transferId: input.transferId, recipientId: input.recipientId, approvedRevisionId: revision.revisionId, approvalHash };
+    return {
+      transferId: input.transferId,
+      recipientId: input.recipientId,
+      approvedRevisionId: revision.revisionId,
+      approvedVersion: revision.version,
+      approvalHash,
+    };
   }
 
+  /**
+   * Accept a prepared transfer only if its approval is for the recipient's
+   * current, verified address version (#1104). Any address change after the
+   * approval — even back to the same address — requires a new approval.
+   */
   submitTransfer(transfer: PreparedTransfer): RecipientRevision {
     const revision = this.mustFind(transfer.recipientId, transfer.approvedRevisionId);
+    const current = this.current(transfer.recipientId);
+    if (revision.revisionId !== current.revisionId || transfer.approvedVersion !== current.version) {
+      throw new StaleRecipientApprovalError(
+        `Approval was for address version ${transfer.approvedVersion}; current version is ${current.version}. Re-approve the transfer.`,
+        transfer.approvedVersion,
+        current.version
+      );
+    }
     if (revision.status !== "verified") {
       throw new Error("Prepared transfer is bound to a recipient revision that is no longer verified");
     }
     return { ...revision };
+  }
+
+  /** Versioned address-change log with actor, time and verification status. */
+  addressChanges(recipientId: string): RecipientAddressChange[] {
+    const revisions = this.revisions.get(recipientId) ?? [];
+    // Report the *current* verification status of each version alongside the change.
+    return (this.changes.get(recipientId) ?? []).map((change) => ({
+      ...change,
+      verificationStatus:
+        revisions.find((r) => r.version === change.toVersion)?.status ?? change.verificationStatus,
+    }));
+  }
+
+  private current(recipientId: string): RecipientRevision {
+    const history = this.revisions.get(recipientId);
+    if (!history?.length) {
+      throw new Error(`Unknown recipient: ${recipientId}`);
+    }
+    return history[history.length - 1];
   }
 
   history(recipientId: string): RecipientRevision[] {
@@ -118,8 +223,25 @@ export class RecipientGovernanceService {
   }
 
   private revision(input: { recipientId: string; identityKey: string; address: string; network: string }, version: number, status: RecipientRevisionStatus, now: Date): RecipientRevision {
+  private revision(
+    input: { recipientId: string; identityKey: string; address: string; network: string },
+    version: number,
+    status: RecipientRevisionStatus,
+    now: Date,
+    actor: string
+  ): RecipientRevision {
     const revisionId = crypto.createHash("sha256").update(`${input.recipientId}:${version}:${input.address}:${input.network}`).digest("hex").slice(0, 16);
-    return { ...input, revisionId, version, status, createdAt: now.toISOString() };
+    return {
+      recipientId: input.recipientId,
+      identityKey: input.identityKey,
+      address: input.address,
+      network: input.network,
+      revisionId,
+      version,
+      status,
+      createdAt: now.toISOString(),
+      createdBy: actor,
+    };
   }
 
   private mustFind(recipientId: string, revisionId: string): RecipientRevision {
