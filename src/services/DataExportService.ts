@@ -8,10 +8,19 @@ import { memoryStore } from "../Agents/memory/memory";
 import logger from "../config/logger";
 import { auditLogService } from "../AuditLog/auditLog.service";
 import { AuditAction, AuditSeverity } from "../AuditLog/auditLog.entity";
+import { sha256Hex } from "../utils/canonicalJson";
 
 export interface ExportScope {
   userId?: string;
   categories?: string[];
+}
+
+export interface ExportOptions {
+  /**
+   * Fixed "now" for exportDate, account age, and memory expiry filtering.
+   * Pinning this makes repeated requests produce identical snapshots.
+   */
+  now?: Date;
 }
 
 export interface ExportJob {
@@ -43,6 +52,12 @@ export interface UserProfileExport {
     exportDate: string;
     exportVersion: string;
     userId: string;
+    /**
+     * SHA-256 over the canonical serialization of the export. Identical for
+     * repeated requests against unchanged data, so clients can verify that
+     * two snapshots match.
+     */
+    snapshotHash?: string;
   };
   profile: {
     id: string;
@@ -101,8 +116,10 @@ export class DataExportService {
 
   async exportUserData(
     userId: string,
-    requestedScope?: ExportScope
+    requestedScope?: ExportScope,
+    options?: ExportOptions
   ): Promise<UserProfileExport> {
+    const now = options?.now ?? new Date();
     if (requestedScope?.userId && requestedScope.userId !== userId) {
       logger.warn("Cross-user export scope access attempt denied", {
         authenticatedUserId: userId,
@@ -139,14 +156,14 @@ export class DataExportService {
       }
 
       const contacts = await this.getContactsByUserId(userId);
-      const conversationHistory = this.getConversationHistory(userId);
+      const conversationHistory = this.getConversationHistory(userId, now);
       const sessions = await this.getUserSessions(userId);
 
-      const accountAge = this.calculateAccountAge(user.createdAt);
+      const accountAge = this.calculateAccountAge(user.createdAt, now);
 
       const exportData: UserProfileExport = {
         exportMetadata: {
-          exportDate: new Date().toISOString(),
+          exportDate: now.toISOString(),
           exportVersion: "1.0.0",
           userId: user.id,
         },
@@ -218,6 +235,8 @@ export class DataExportService {
         },
       });
 
+      exportData.exportMetadata.snapshotHash = sha256Hex(exportData);
+
       return exportData;
     } catch (error) {
       logger.error("Failed to export user data", { userId, error });
@@ -228,23 +247,22 @@ export class DataExportService {
   private async getContactsByUserId(userId: string): Promise<Contact[]> {
     return this.contactRepository.find({
       where: { userId },
-      order: { createdAt: "DESC" },
+      order: { createdAt: "DESC", id: "DESC" },
     });
   }
 
-  private getConversationHistory(userId: string): string[] {
-    return memoryStore.get(userId);
+  private getConversationHistory(userId: string, now: Date): string[] {
+    return memoryStore.get(userId, now.getTime());
   }
 
   private async getUserSessions(userId: string): Promise<RefreshToken[]> {
     return this.refreshTokenRepository.find({
       where: { userId },
-      order: { createdAt: "DESC" },
+      order: { createdAt: "DESC", id: "DESC" },
     });
   }
 
-  private calculateAccountAge(createdAt: Date): string {
-    const now = new Date();
+  private calculateAccountAge(createdAt: Date, now: Date): string {
     const diffMs = now.getTime() - createdAt.getTime();
     const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
 
@@ -267,19 +285,26 @@ export class DataExportService {
     }
   }
 
-  async exportUserDataAsJSON(userId: string): Promise<string> {
-    const exportData = await this.exportUserData(userId);
+  async exportUserDataAsJSON(
+    userId: string,
+    options?: ExportOptions
+  ): Promise<string> {
+    const exportData = await this.exportUserData(userId, undefined, options);
     return JSON.stringify(exportData, null, 2);
   }
 
-  async exportUserDataAsBuffer(userId: string): Promise<Buffer> {
-    const jsonString = await this.exportUserDataAsJSON(userId);
+  async exportUserDataAsBuffer(
+    userId: string,
+    options?: ExportOptions
+  ): Promise<Buffer> {
+    const jsonString = await this.exportUserDataAsJSON(userId, options);
     return Buffer.from(jsonString, "utf-8");
   }
 
   async requestAsyncExport(
     userId: string,
-    requestedScope?: ExportScope
+    requestedScope?: ExportScope,
+    options?: ExportOptions
   ): Promise<ExportJob> {
     if (requestedScope?.userId && requestedScope.userId !== userId) {
       logger.warn("Cross-user async export scope attempt denied", {
@@ -309,7 +334,7 @@ export class DataExportService {
     }
 
     const exportId = randomUUID();
-    const exportData = await this.exportUserData(userId);
+    const exportData = await this.exportUserData(userId, undefined, options);
 
     const job: ExportJob = {
       id: exportId,

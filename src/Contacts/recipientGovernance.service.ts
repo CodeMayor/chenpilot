@@ -1,4 +1,8 @@
 import crypto from "crypto";
+import {
+  canonicalChainIdentity,
+  DuplicateRecipientError,
+} from "./chainIdentity";
 
 export type RecipientRevisionStatus = "pending_verification" | "verified" | "superseded";
 
@@ -58,12 +62,9 @@ export class RecipientGovernanceService {
   private readonly revisions = new Map<string, RecipientRevision[]>();
   private readonly changes = new Map<string, RecipientAddressChange[]>();
 
-  createRecipient(
-    input: { recipientId: string; identityKey: string; address: string; network: string; actor?: string },
-    now = new Date()
-  ): RecipientRevision {
-    const actor = input.actor ?? "system";
-    const revision = this.revision(input, 1, "pending_verification", now, actor);
+  createRecipient(input: { recipientId: string; identityKey: string; address: string; network: string }, now = new Date()): RecipientRevision {
+    this.assertNoDuplicateIdentity(input.network, input.address, input.recipientId);
+    const revision = this.revision(input, 1, "pending_verification", now);
     this.revisions.set(input.recipientId, [revision]);
     this.changes.set(input.recipientId, [
       {
@@ -103,9 +104,14 @@ export class RecipientGovernanceService {
     }
 
     const current = history[history.length - 1];
-    if (current.address === input.address && current.network === input.network) {
+    if (
+      canonicalChainIdentity(current.network, current.address) ===
+      canonicalChainIdentity(input.network, input.address)
+    ) {
       return { ...current };
     }
+
+    this.assertNoDuplicateIdentity(input.network, input.address, input.recipientId);
 
     current.status = "superseded";
     current.supersededAt = now.toISOString();
@@ -192,6 +198,31 @@ export class RecipientGovernanceService {
     return (this.revisions.get(recipientId) ?? []).map((revision) => ({ ...revision }));
   }
 
+  /**
+   * Reject identities already claimed by a different recipient's latest
+   * (non-superseded) revision, comparing canonical chain identity so case
+   * and whitespace variants cannot bypass the check.
+   */
+  private assertNoDuplicateIdentity(
+    network: string,
+    address: string,
+    recipientId: string
+  ): void {
+    const identity = canonicalChainIdentity(network, address);
+    for (const [otherId, history] of this.revisions) {
+      if (otherId === recipientId || history.length === 0) {
+        continue;
+      }
+      const latest = history[history.length - 1];
+      if (
+        canonicalChainIdentity(latest.network, latest.address) === identity
+      ) {
+        throw new DuplicateRecipientError(identity, latest.revisionId);
+      }
+    }
+  }
+
+  private revision(input: { recipientId: string; identityKey: string; address: string; network: string }, version: number, status: RecipientRevisionStatus, now: Date): RecipientRevision {
   private revision(
     input: { recipientId: string; identityKey: string; address: string; network: string },
     version: number,

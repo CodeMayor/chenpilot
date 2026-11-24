@@ -26,13 +26,21 @@ export class WorkflowConcurrencyEngine {
       return false; // Already handled by another concurrent actor
     }
 
-    // Perform side effect once atomically
-    await sideEffectFn();
-
+    // Claim the attempt synchronously: there is no await between the status
+    // check above and this write, so a concurrent caller cannot pass the
+    // same check and run the side effect twice.
     state.status = actor === 'recovery' ? 'recovered' : 'intervened';
     state.version += 1;
     this.states.set(workflowId, state);
 
-    return true;
+    try {
+      await sideEffectFn();
+      return true;
+    } catch (error) {
+      // Release the claim so a later attempt can retry the side effect.
+      state.status = 'running';
+      state.version -= 1;
+      throw error;
+    }
   }
 }
