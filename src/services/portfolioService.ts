@@ -26,6 +26,32 @@ import {
   type WithdrawableTotals,
 } from "./protocolBalances";
 
+import {
+  buildDisplayedTotals,
+  displayAssetQuantity,
+  type RoundingPolicy,
+} from "../Portfolio/roundingPolicy";
+
+/**
+ * Display-ready strings for a portfolio (#1100). Numeric fields above stay
+ * unrounded; render these instead. Rows always add up to `totalValue`.
+ */
+export interface PortfolioDisplay {
+  policy: RoundingPolicy & { assetQuantityPrecision: number };
+  assets: Array<{
+    code: string;
+    issuer: string;
+    /** Quantity at 7 dp, half_even. */
+    amount: string;
+    /** Value at the currency's precision, half_even; null when unpriced. */
+    valueInCurrency: string | null;
+  }>;
+  /** Rounded once from the exact sum of priced rows; null when nothing is priced. */
+  totalValue: string | null;
+  /** Assets whose displayed value was nudged by one minimal unit so rows match the total. */
+  adjustedAssets: string[];
+}
+
 export interface AssetBalance {
   /** Asset code, e.g. "XLM", "USDC" */
   code: string;
@@ -70,6 +96,31 @@ export interface PortfolioSummary {
   withdrawable: PortfolioWithdrawable;
   /** ISO timestamp of when this snapshot was taken */
   fetchedAt: string;
+  /** Rounded display values under the documented rounding policy (#1100) */
+  display?: PortfolioDisplay;
+}
+
+/** Build display strings for a portfolio's assets and total (#1100). */
+export function buildPortfolioDisplay(
+  assets: Pick<AssetBalance, "code" | "issuer" | "balance" | "amount" | "valueInCurrency">[],
+  currency: string
+): PortfolioDisplay {
+  const keyOf = (a: { code: string; issuer: string }) => (a.issuer ? `${a.code}:${a.issuer}` : a.code);
+  const totals = buildDisplayedTotals(
+    assets.map((a) => ({ id: keyOf(a), value: a.valueInCurrency })),
+    currency
+  );
+  return {
+    policy: { ...totals.policy, assetQuantityPrecision: 7 },
+    assets: assets.map((a, i) => ({
+      code: a.code,
+      issuer: a.issuer,
+      amount: displayAssetQuantity(a.balance || a.amount),
+      valueInCurrency: totals.rows[i].displayed,
+    })),
+    totalValue: totals.total?.displayed ?? null,
+    adjustedAssets: totals.adjustedRowIds,
+  };
 }
 
 /**
@@ -389,6 +440,7 @@ export class PortfolioService {
       totalValue,
       withdrawable,
       fetchedAt: new Date().toISOString(),
+      display: buildPortfolioDisplay(assets, normalizedCurrency),
     };
   }
 

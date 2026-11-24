@@ -116,7 +116,7 @@ describe("DataExportService", () => {
       expect(result).toBeDefined();
       expect(mockContactRepository.find).toHaveBeenCalledWith({
         where: { userId: "user-123" },
-        order: { createdAt: "DESC" },
+        order: { createdAt: "DESC", id: "DESC" },
       });
       expect(result.exportMetadata.userId).toBe("user-123");
       expect(result.exportMetadata.exportVersion).toBe("1.0.0");

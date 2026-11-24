@@ -134,10 +134,14 @@ router.get(
       const endDate = req.query.endDate
         ? new Date(req.query.endDate as string)
         : undefined;
+      const asOf = req.query.asOf
+        ? new Date(req.query.asOf as string)
+        : undefined;
 
       const report = await operatorReportingService.buildReport({
         startDate,
         endDate,
+        asOf,
       });
 
       return res.status(200).json({
@@ -859,7 +863,12 @@ router.get(
   async (req: Request, res: Response) => {
     try {
       const limit = Math.min(Number(req.query.limit) || 25, 100);
-      const jobs = await jobQueueService.getDeadLetterJobs(limit);
+      const disposition =
+        typeof req.query.disposition === "string" &&
+        ["pending_review", "replayed", "discarded"].includes(req.query.disposition)
+          ? (req.query.disposition as "pending_review" | "replayed" | "discarded")
+          : undefined;
+      const jobs = await jobQueueService.getDeadLetterJobs(limit, disposition);
       res.json({
         success: true,
         count: jobs.length,
@@ -871,6 +880,62 @@ router.get(
         success: false,
         message: "Failed to fetch dead-letter jobs",
       });
+    }
+  }
+);
+
+/**
+ * Replay a dead-lettered job as a new attempt chain (#1068). Idempotent: a
+ * second call returns the job created by the first. The replayed job is
+ * re-authorized as its original user when it runs.
+ */
+router.post(
+  "/admin/jobs/dead-letter/:jobId/replay",
+  authenticateToken,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const operatorId = req.user?.userId;
+      if (!operatorId) {
+        return res.status(401).json({ success: false, message: "Unauthenticated" });
+      }
+      const result = await jobQueueService.replayDeadLetterJob(req.params.jobId, operatorId);
+      switch (result.status) {
+        case "replayed":
+          return res.status(201).json({ success: true, status: result.status, replayJobId: result.replayJobId });
+        case "already_replayed":
+          return res.status(200).json({ success: true, status: result.status, replayJobId: result.replayJobId });
+        case "not_found":
+          return res.status(404).json({ success: false, status: result.status });
+        default:
+          return res.status(409).json({ success: false, status: result.status });
+      }
+    } catch (error) {
+      logger.error("Failed to replay dead-letter job", { error });
+      return res.status(500).json({ success: false, message: "Failed to replay dead-letter job" });
+    }
+  }
+);
+
+/** Close a dead-lettered job without replaying it (#1068). */
+router.post(
+  "/admin/jobs/dead-letter/:jobId/discard",
+  authenticateToken,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const operatorId = req.user?.userId;
+      if (!operatorId) {
+        return res.status(401).json({ success: false, message: "Unauthenticated" });
+      }
+      const note = typeof req.body?.note === "string" ? req.body.note.slice(0, 2000) : undefined;
+      const discarded = await jobQueueService.discardDeadLetterJob(req.params.jobId, operatorId, note);
+      return discarded
+        ? res.json({ success: true, status: "discarded" })
+        : res.status(409).json({ success: false, message: "Job is not a dead-lettered job pending review" });
+    } catch (error) {
+      logger.error("Failed to discard dead-letter job", { error });
+      return res.status(500).json({ success: false, message: "Failed to discard dead-letter job" });
     }
   }
 );

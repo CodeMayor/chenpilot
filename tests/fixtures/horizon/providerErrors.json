@@ -1,0 +1,237 @@
+{
+  "description": "Regression corpus for malformed Horizon provider error payloads. Every case is replayed through HorizonSubmissionGateway.submit(); 'rejected' outcomes are only allowed for provable definitive result codes, everything else must surface as AmbiguousSubmissionError.",
+  "submitCases": [
+    {
+      "name": "definitive_tx_bad_auth",
+      "description": "Well-formed Horizon 400 with a definitive transaction result code",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "title": "Bad Request",
+            "extras": {
+              "result_codes": { "transaction": "tx_bad_auth" },
+              "result_xdr": "AAAAAGQAAAAAAAAA"
+            }
+          }
+        }
+      },
+      "expect": "rejected",
+      "reason": "tx_bad_auth"
+    },
+    {
+      "name": "definitive_tx_insufficient_balance",
+      "description": "Second definitive code as a control",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_insufficient_balance" }
+            }
+          }
+        }
+      },
+      "expect": "rejected",
+      "reason": "tx_insufficient_balance"
+    },
+    {
+      "name": "tx_bad_seq_is_ambiguous",
+      "description": "tx_bad_seq is deliberately excluded: Horizon returns it both when another transaction took the sequence and when ours already applied",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_bad_seq" }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "unknown_result_code",
+      "description": "400 with a result code outside the definitive set",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_not_a_real_code" }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "uppercase_result_code",
+      "description": "Result codes are matched case-sensitively; uppercase must not classify as rejected",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "TX_BAD_AUTH" }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "server_error_500",
+      "description": "Horizon 500 with a definitive-looking code still cannot prove rejection",
+      "error": {
+        "response": {
+          "status": 500,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_bad_auth" }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "status_as_string",
+      "description": "response.status arriving as a string must not satisfy the === 400 check",
+      "error": {
+        "response": {
+          "status": "400",
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_bad_auth" }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "missing_response",
+      "description": "Error object without a response envelope",
+      "error": { "message": "socket hang up" },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "html_error_body",
+      "description": "Proxy/load-balancer HTML error page instead of a JSON Horizon error",
+      "error": {
+        "response": {
+          "status": 502,
+          "data": "<html><body>Bad Gateway</body></html>"
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "extras_as_array",
+      "description": "extras present but not an object",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": { "extras": ["tx_bad_auth"] }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "result_codes_as_string",
+      "description": "result_codes present but not an object",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": { "result_codes": "tx_bad_auth" }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "result_code_as_number",
+      "description": "transaction result code arriving as a number",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": 400 }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "result_code_as_object",
+      "description": "transaction result code arriving as a nested object",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": { "code": "tx_bad_auth" } }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "operations_code_only",
+      "description": "Only per-operation result codes present; no transaction-level code",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": {
+                "operations": ["op_underfunded"]
+              }
+            }
+          }
+        }
+      },
+      "expect": "ambiguous"
+    },
+    {
+      "name": "error_is_plain_string",
+      "description": "Provider client rejecting with a bare string",
+      "error": "ECONNRESET",
+      "expect": "ambiguous"
+    },
+    {
+      "name": "error_is_null",
+      "description": "Provider client rejecting with null",
+      "error": null,
+      "expect": "ambiguous"
+    },
+    {
+      "name": "error_is_empty_object",
+      "description": "Provider client rejecting with an empty object",
+      "error": {},
+      "expect": "ambiguous"
+    },
+    {
+      "name": "definitive_with_malformed_result_xdr",
+      "description": "Definitive code still proves rejection even when result_xdr is not a string",
+      "error": {
+        "response": {
+          "status": 400,
+          "data": {
+            "extras": {
+              "result_codes": { "transaction": "tx_malformed" },
+              "result_xdr": 12345
+            }
+          }
+        }
+      },
+      "expect": "rejected",
+      "reason": "tx_malformed"
+    }
+  ]
+}

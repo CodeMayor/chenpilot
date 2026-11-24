@@ -11,10 +11,17 @@ import {
   type TimezoneReportQuery,
   type UTCBoundaries,
 } from "./timezoneReporting.service";
+import { sha256Hex } from "../utils/canonicalJson";
 
 export interface OperatorReportQuery {
   startDate?: Date;
   endDate?: Date;
+
+  /**
+   * Optional fixed "now" used when endDate is not provided. Pinning this
+   * makes repeated requests for the same query produce identical reports.
+   */
+  asOf?: Date;
 
   /**
    * Optional timezone-aware query parameters.
@@ -27,6 +34,13 @@ export interface OperatorReportQuery {
 export interface OperatorReport {
   periodStart: string;
   periodEnd: string;
+
+  /**
+   * SHA-256 over the canonical serialization of the report. Identical for
+   * repeated requests that resolve to the same period and data, so clients
+   * can verify snapshot equality.
+   */
+  snapshotHash: string;
 
   /**
    * Timezone information (populated when timezone query is used).
@@ -83,7 +97,7 @@ export class OperatorReportingService {
       periodEnd = tzInfo.endUTC;
     } else {
       // Fall back to existing behavior (UTC-based)
-      periodEnd = query.endDate ?? new Date();
+      periodEnd = query.endDate ?? query.asOf ?? new Date();
       periodStart =
         query.startDate ?? new Date(periodEnd.getTime() - 24 * 60 * 60 * 1000);
     }
@@ -108,9 +122,10 @@ export class OperatorReportingService {
       )
     ).sort();
 
-    return {
+    const report: OperatorReport = {
       periodStart: periodStart.toISOString(),
       periodEnd: periodEnd.toISOString(),
+      snapshotHash: "",
       timezone: tzInfo
         ? {
           name: tzInfo.timezone,
@@ -128,6 +143,9 @@ export class OperatorReportingService {
         capabilities,
       },
     };
+
+    report.snapshotHash = sha256Hex({ ...report, snapshotHash: undefined });
+    return report;
   }
 
   private async getExecutionSummary(
@@ -245,10 +263,18 @@ export class OperatorReportingService {
   private rowsToCountMap(
     rows: Array<{ key: string; count: string }>
   ): Record<string, number> {
-    return rows.reduce<Record<string, number>>((acc, row) => {
+    const counts = rows.reduce<Record<string, number>>((acc, row) => {
       acc[row.key] = Number.parseInt(row.count, 10);
       return acc;
     }, {});
+
+    // GROUP BY row order is not guaranteed; emit keys sorted so repeated
+    // requests serialize identically.
+    return Object.fromEntries(
+      Object.keys(counts)
+        .sort()
+        .map((key) => [key, counts[key]])
+    );
   }
 }
 

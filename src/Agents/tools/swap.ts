@@ -168,6 +168,7 @@ export class SwapTool extends BaseTool<SwapPayload> {
         userId,
         lockKey,
         lockValue: lockResult.lockValue,
+        fencingToken: lockResult.fencingToken,
       });
 
       const heartbeat = this.startLockHeartbeat(lockKey, userId);
@@ -178,7 +179,8 @@ export class SwapTool extends BaseTool<SwapPayload> {
         userId,
         lockKey,
         lifecycle.id,
-        heartbeat
+        heartbeat,
+        lockResult.fencingToken
       );
 
       return lockReleased;
@@ -259,7 +261,8 @@ export class SwapTool extends BaseTool<SwapPayload> {
     userId: string,
     lockKey: string,
     lifecycleId: string,
-    heartbeat?: NodeJS.Timeout
+    heartbeat?: NodeJS.Timeout,
+    fencingToken?: number
   ): Promise<ToolResult> {
     try {
       // Validate tokens
@@ -447,6 +450,12 @@ export class SwapTool extends BaseTool<SwapPayload> {
       }
 
       // Submission phase
+      // #1070: if the trade lock expired while we were simulating/signing and
+      // another holder acquired it, do not submit with our stale token.
+      if (fencingToken !== undefined) {
+        await this.lockService.assertFencingToken(lockKey, fencingToken);
+      }
+
       await transactionLifecycleService.transition(lifecycleId, "submitting");
       await sequenceLeaseService.validateLease(lease.id, leaseResult.fencingToken);
 
