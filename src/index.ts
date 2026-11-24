@@ -45,17 +45,36 @@ class Server {
         logger.info("Stellar large operation alert emitted", alert);
       });
 
+      let shuttingDown = false;
       const shutdown = async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
         logger.info("Shutting down gracefully...");
+
+        // 1. Stop accepting new work: no new HTTP connections, no new jobs,
+        //    no new scheduled/streamed work.
+        const serverClosed = new Promise<void>((resolve) =>
+          this.server.close(() => {
+            logger.info("Server closed");
+            resolve();
+          })
+        );
         horizonOperationStreamerService.stop();
         priceSpikeAlertService.stop();
         retentionEngine.stop();
-        await this.jobWorker.stop();
+
+        // 2. Drain in-flight job handlers up to the deadline (#1069); jobs
+        //    still running at the deadline are returned to the queue.
+        const report = await this.jobWorker.stop();
+        logger.info("Job worker drain finished", report);
+
+        // 3. Release the database only after handlers are done or released.
+        await Promise.race([
+          serverClosed,
+          new Promise((resolve) => setTimeout(resolve, 5000)),
+        ]);
         await AppDataSource.destroy();
-        this.server.close(() => {
-          logger.info("Server closed");
-          process.exit(0);
-        });
+        process.exit(0);
       };
       // Refuse to boot a shared environment with placeholder, revoked or
       // mis-provisioned secrets.
