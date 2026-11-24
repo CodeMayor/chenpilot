@@ -134,10 +134,14 @@ router.get(
       const endDate = req.query.endDate
         ? new Date(req.query.endDate as string)
         : undefined;
+      const asOf = req.query.asOf
+        ? new Date(req.query.asOf as string)
+        : undefined;
 
       const report = await operatorReportingService.buildReport({
         startDate,
         endDate,
+        asOf,
       });
 
       return res.status(200).json({

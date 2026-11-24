@@ -2,6 +2,10 @@ import { injectable } from "tsyringe";
 import { Repository } from "typeorm";
 import { Contact } from "./contact.entity";
 import AppDataSource from "../config/Datasource";
+import {
+  canonicalChainIdentity,
+  DuplicateRecipientError,
+} from "./chainIdentity";
 
 @injectable()
 export default class ContactService {
@@ -15,6 +19,20 @@ export default class ContactService {
     payload: { name: string; address: string; tokenType: string },
     userId: string
   ): Promise<Contact> {
+    // tokenType is the chain/asset discriminator on Contact; the canonical
+    // (chain, address) pair identifies a recipient independent of input case.
+    const identity = canonicalChainIdentity(payload.tokenType, payload.address);
+    const candidates = await this.contactRepository.find({
+      where: { userId },
+    });
+    const duplicate = candidates.find(
+      (contact) =>
+        canonicalChainIdentity(contact.tokenType, contact.address) === identity
+    );
+    if (duplicate) {
+      throw new DuplicateRecipientError(identity, duplicate.id);
+    }
+
     const contact = this.contactRepository.create({
       ...payload,
       userId,
