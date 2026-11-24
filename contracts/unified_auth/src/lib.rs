@@ -386,3 +386,4 @@ impl UnifiedAuthContract {
 }
 
 mod test;
+mod auth_binding_fuzz;

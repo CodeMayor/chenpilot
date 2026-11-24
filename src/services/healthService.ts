@@ -5,6 +5,7 @@ import AppDataSource, { getPoolStats } from "../config/Datasource";
 import config from "../config/config";
 import { clockSkewService } from "./clock/clockSkew.service";
 import type { ClockSample } from "./clock/types";
+import { checkSchemaCompatibility, type SchemaSource } from "./schemaCompatibility";
 
 export type DependencyStatus = "UP" | "DEGRADED" | "DOWN";
 export type OverallStatus = "HEALTHY" | "DEGRADED" | "UNHEALTHY";
@@ -29,6 +30,7 @@ export interface HealthReport {
     email: DependencyHealth;
     llm: DependencyHealth;
     clockSkew: DependencyHealth;
+    schema: DependencyHealth;
   };
 }
 
@@ -287,13 +289,52 @@ async function checkClockSkew(): Promise<DependencyHealth> {
   };
 }
 
-function computeOverall(deps: HealthReport["dependencies"]): OverallStatus {
+/**
+ * Schema compatibility (#1064): pending migrations make the service not ready;
+ * a database ahead of this build is degraded. Never reports UP on a mismatch.
+ */
+async function checkSchema(): Promise<DependencyHealth> {
+  if (!AppDataSource.isInitialized) {
+    return { status: "DOWN", latencyMs: 0, error: "DataSource not initialized" };
+  }
+
+  const out = await timed(() =>
+    checkSchemaCompatibility(AppDataSource as unknown as SchemaSource)
+  );
+  if ("error" in out) {
+    return {
+      status: "DOWN",
+      latencyMs: out.latencyMs,
+      error: `Could not read migration state: ${out.error.message}`,
+    };
+  }
+
+  const r = out.result;
+  const detail = {
+    compatibility: r.status,
+    requiredVersion: r.requiredVersion,
+    appliedVersion: r.appliedVersion,
+    pending: r.pending,
+    unknown: r.unknown,
+  };
+  if (r.status === "COMPATIBLE") {
+    return { status: "UP", latencyMs: out.latencyMs, detail };
+  }
+  return {
+    status: r.status === "PENDING_MIGRATIONS" ? "DOWN" : "DEGRADED",
+    latencyMs: out.latencyMs,
+    error: r.action,
+    detail,
+  };
+}
+
+export function computeOverall(deps: HealthReport["dependencies"]): OverallStatus {
   const entries = Object.entries(deps) as [
     keyof HealthReport["dependencies"],
     DependencyHealth,
   ][];
 
-  const criticalDeps = ["database", "redis", "clockSkew"] as const;
+  const criticalDeps = ["database", "redis", "clockSkew", "schema"] as const;
   const criticalDown = criticalDeps.some((key) => deps[key].status === "DOWN");
   if (criticalDown) return "UNHEALTHY";
 
@@ -306,7 +347,7 @@ function computeOverall(deps: HealthReport["dependencies"]): OverallStatus {
 
 export class HealthService {
   async getFullReport(): Promise<HealthReport> {
-    const [database, redis, horizon, sorobanRpc, email, llm, clockSkew] =
+    const [database, redis, horizon, sorobanRpc, email, llm, clockSkew, schema] =
       await Promise.all([
         checkDatabase(),
         checkRedis(),
@@ -315,6 +356,7 @@ export class HealthService {
         checkEmail(),
         checkLlm(),
         checkClockSkew(),
+        checkSchema(),
       ]);
 
     const dependencies = {
@@ -325,6 +367,7 @@ export class HealthService {
       email,
       llm,
       clockSkew,
+      schema,
     };
 
     return {

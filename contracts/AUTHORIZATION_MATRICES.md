@@ -736,3 +736,29 @@ This authorization matrix provides a comprehensive view of access control across
 5. **Event Emission**: All authorization changes should emit events
 
 Any authorization issues should be addressed before deployment to ensure proper access control and security.
+
+---
+
+## Authorization Argument Binding Fuzzing (#1063)
+
+A Soroban authorization signed by an address binds the **contract address**,
+**function symbol**, the **exact argument list** (order, values and count), and a
+**nonce**. `unified_auth/src/auth_binding_fuzz.rs` starts from a valid admin
+authorization for `grant_role` or `register_contract` and applies seeded random
+mutations:
+
+| Mutation | Example | Expected |
+|---|---|---|
+| Contract address | Auth names a second deployment of the same contract | Rejected |
+| Function symbol | Auth for `revoke_role` / `init` / near-miss `grant_rolf`, invoke `grant_role` | Rejected |
+| Argument order | Auth `(role, to)`, invoke `(to, role)` | Rejected |
+| Argument value | Auth for a different user, role or `ContractId` | Rejected |
+| Argument count | Auth with an argument dropped or an extra `()` appended | Rejected |
+| Nonce reuse | Replay a consumed authorization after its effect is undone | Rejected |
+
+Every rejected case asserts that storage on both deployments (super admin, all
+role flags, contract registrations) is unchanged. A control test asserts the
+exact authorized invocation succeeds.
+
+Run: `cargo test -p unified_auth auth_binding_fuzz` (256 iterations, fixed seed;
+a failure message names the iteration and mutation).

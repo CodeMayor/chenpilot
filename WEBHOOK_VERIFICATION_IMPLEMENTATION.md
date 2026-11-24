@@ -306,3 +306,33 @@ This implementation fully satisfies all acceptance criteria for issue #682:
 4. ✅ **Comprehensive test coverage** - 45+ tests covering body mutation, duplicate delivery, timestamp skew, and oversized input
 
 All webhook endpoints now authenticate at the edge, preventing forged updates and resource consumption attacks.
+
+---
+
+## Issue #1065 - Transaction boundaries in idempotent webhook handlers
+
+Audit of handlers that record a webhook as processed:
+
+| Handler | Dedup record | State change / side effect | Boundary |
+|---|---|---|---|
+| Stellar funding (`StellarWebhookService.processFundingWebhook`) | `webhook_idempotency` row | `user.isFunded` + `funding.auto_deploy` job | **One DB transaction** (fixed in #1065) |
+| Telegram / Discord (`PlatformWebhookService`) | `DurableOperationService` idempotent key | Handled by the durable operation | Already atomic via the durable operation record |
+
+Previously the funding handler committed the idempotency row on its own before
+updating the user and enqueueing the job. A crash in between left the event
+marked as processed with no side effect, and the provider's retry was dropped
+as a duplicate.
+
+Now the idempotency row (inserted with `ON CONFLICT DO NOTHING`), the user
+update and the job insert all run in a single `AppDataSource.transaction`:
+
+- **Crash before commit:** nothing is persisted; the provider retry is processed normally.
+- **After commit:** redeliveries return `"Webhook already processed (idempotent)"` and enqueue nothing.
+- **Concurrent deliveries:** the second insert waits on the unique index; exactly one job is created.
+- **Unknown address:** nothing is recorded, so a redelivery after the user exists is still processed.
+
+`JobQueueService.enqueue` / `enqueueWithContext` accept an optional
+`EntityManager` so jobs can join a caller's transaction.
+
+Tests: `src/Gateway/__tests__/webhookTransactionBoundary.integration.test.ts`
+(crash/retry, concurrent delivery, unknown address).

@@ -1,4 +1,4 @@
-import { DataSource, LessThan, Repository } from "typeorm";
+import { DataSource, EntityManager, LessThan, Repository } from "typeorm";
 import AppDataSource from "../config/Datasource";
 import logger from "../config/logger";
 import { QueueJob, type DeadLetterDisposition, type FailureClass } from "./job.entity";
@@ -89,7 +89,11 @@ export class JobQueueService {
     return this.dataSource.getRepository(QueueJob);
   }
 
-  async enqueue(input: EnqueueJobInput): Promise<QueueJob> {
+  /**
+   * Enqueue a job. Pass `manager` to insert the job inside the caller's
+   * transaction so it commits (or rolls back) with the caller's state change.
+   */
+  async enqueue(input: EnqueueJobInput, manager?: EntityManager): Promise<QueueJob> {
     // User-initiated work is throttled before it reaches the queue; system
     // jobs (no userId) are not subject to per-user limits.
     if (input.userId) {
@@ -104,7 +108,8 @@ export class JobQueueService {
       }
     }
 
-    const job = this.repository.create({
+    const repository = manager ? manager.getRepository(QueueJob) : this.repository;
+    const job = repository.create({
       queue: input.queue,
       jobType: input.jobType,
       payload: input.payload,
@@ -116,7 +121,7 @@ export class JobQueueService {
       status: "pending",
     });
 
-    const saved = await this.repository.save(job);
+    const saved = await repository.save(job);
     logger.info("Queue job enqueued", {
       jobId: saved.id,
       queue: saved.queue,
@@ -128,7 +133,8 @@ export class JobQueueService {
   }
 
   async enqueueWithContext<T extends Record<string, unknown>>(
-    input: EnqueueJobInput
+    input: EnqueueJobInput,
+    manager?: EntityManager
   ): Promise<QueueJob> {
     const context = getExecutionContext();
     return this.enqueue({
@@ -145,7 +151,7 @@ export class JobQueueService {
             }
           : {}),
       },
-    });
+    }, manager);
   }
 
   async leaseJobs(

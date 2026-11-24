@@ -24,6 +24,15 @@ import { legalHoldService } from "./legalHold";
 import { JobQueueService } from "../jobs/jobQueue.service";
 import { memoryStore } from "../Agents/memory/memory";
 import logger from "../config/logger";
+import {
+  PostgresTaskLeaseStore,
+  defaultLeaseOwner,
+  runLeasedOccurrence,
+  type TaskLeaseStore,
+} from "../Reliability/scheduledTaskLease";
+
+/** A retention pass should finish well within this; a crashed worker's lease frees up after it. */
+const RETENTION_LEASE_TTL_MS = 2 * 60 * 60 * 1000;
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -40,6 +49,8 @@ export interface RetentionPassResult {
 export class RetentionEngine {
   private intervalHandle: NodeJS.Timeout | null = null;
   private jobQueueService: JobQueueService;
+
+  private readonly leaseOwner = defaultLeaseOwner();
 
   constructor(private readonly ds: DataSource = AppDataSource) {
     this.jobQueueService = new JobQueueService(ds);
@@ -314,14 +325,43 @@ export class RetentionEngine {
 
     // First run at the next scheduled time, then every 24h
     const firstTimeout = setTimeout(() => {
-      void this.runRetentionPass();
+      void this.runScheduledRetentionPass();
       this.intervalHandle = setInterval(() => {
-        void this.runRetentionPass();
+        void this.runScheduledRetentionPass();
       }, 24 * 60 * 60 * 1000);
     }, msUntilFirst);
 
     // Store the first timeout so stop() can clear it
     this.intervalHandle = firstTimeout;
+  }
+
+  /**
+   * Scheduled entry point (#1067): every instance's timer fires, but only the
+   * worker that wins the lease for today's UTC date runs the pass.
+   */
+  async runScheduledRetentionPass(
+    now: Date = new Date(),
+    store: TaskLeaseStore = new PostgresTaskLeaseStore(this.ds)
+  ): Promise<void> {
+    try {
+      const outcome = await runLeasedOccurrence(
+        store,
+        {
+          taskKey: "retention.daily",
+          occurrenceKey: now.toISOString().slice(0, 10),
+          owner: this.leaseOwner,
+          ttlMs: RETENTION_LEASE_TTL_MS,
+        },
+        () => this.runRetentionPass()
+      );
+      if (outcome.status === "stale") {
+        logger.warn("RetentionEngine: pass finished after its lease was taken over");
+      }
+    } catch (err) {
+      logger.error("RetentionEngine: scheduled pass failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Stops the scheduled retention pass. */

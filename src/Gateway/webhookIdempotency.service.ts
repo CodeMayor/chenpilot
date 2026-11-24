@@ -1,4 +1,4 @@
-import { Repository } from "typeorm";
+import { EntityManager, Repository } from "typeorm";
 import AppDataSource from "../config/Datasource";
 import { WebhookIdempotency } from "./webhookIdempotency.entity";
 
@@ -75,6 +75,34 @@ export class WebhookIdempotencyService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Record a webhook inside the caller's transaction (#1065).
+   *
+   * Uses INSERT ... ON CONFLICT DO NOTHING so a duplicate never aborts the
+   * surrounding Postgres transaction. A concurrent delivery of the same event
+   * blocks on the unique index until the first transaction finishes: if it
+   * commits, this returns false; if it rolls back, this one claims the event.
+   *
+   * @returns true if this transaction claimed the event, false if already recorded
+   */
+  async recordInTransaction(
+    manager: EntityManager,
+    webhookId: string,
+    platform: string,
+    metadata?: Record<string, unknown>
+  ): Promise<boolean> {
+    const result = await manager
+      .createQueryBuilder()
+      .insert()
+      .into(WebhookIdempotency)
+      .values({ webhookId, platform, metadata })
+      .orIgnore()
+      .returning(["id"])
+      .execute();
+    const rows = Array.isArray(result.raw) ? result.raw : [];
+    return rows.length > 0;
   }
 
   /**

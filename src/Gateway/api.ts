@@ -158,12 +158,18 @@ app.get("/health", (_req, res) => {
  * /ready:
  *   get:
  *     summary: Readiness probe — 200 if healthy/degraded, 503 if critical deps are down
+ *     description: >
+ *       Includes `dependencies.schema` (#1064), which compares applied TypeORM
+ *       migrations with the ones this build ships. Pending migrations make the
+ *       service not ready (503) and `dependencies.schema.error` carries the
+ *       command to run (`npm run migration:run`). A database ahead of the build
+ *       is reported as DEGRADED.
  *     tags: [Ops]
  *     responses:
  *       200:
  *         description: Service is ready (HEALTHY or DEGRADED)
  *       503:
- *         description: Service is not ready (UNHEALTHY — critical dependency down)
+ *         description: Service is not ready (UNHEALTHY — critical dependency down or pending migrations)
  */
 app.get("/ready", async (_req, res) => {
   try {

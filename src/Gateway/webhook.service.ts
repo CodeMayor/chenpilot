@@ -1,4 +1,5 @@
 import { Request } from "express";
+import { EntityManager } from "typeorm";
 import crypto from "crypto";
 import AppDataSource from "../config/Datasource";
 import { User } from "../Auth/user.entity";
@@ -43,7 +44,6 @@ export interface WebhookResult {
  */
 export class StellarWebhookService {
   private readonly WEBHOOK_SECRET: string;
-  private readonly userRepository = AppDataSource.getRepository(User);
 
   constructor() {
     this.WEBHOOK_SECRET = process.env.STELLAR_WEBHOOK_SECRET || "";
@@ -158,32 +158,69 @@ export class StellarWebhookService {
   }
 
   /**
-   * Find user by Stellar address
+   * Transactional part of the funding webhook: every write goes through
+   * `manager`, so the idempotency record and its side effects are atomic.
+   * Any error thrown here rolls the whole transaction back.
    */
-  private async findUserByAddress(address: string): Promise<User | null> {
-    try {
-      return await this.userRepository.findOne({
-        where: { address },
-      });
-    } catch (error) {
-      console.error("Error finding user by address:", error);
-      return null;
-    }
-  }
+  private async applyFundingWebhook(
+    manager: EntityManager,
+    payload: StellarWebhookPayload
+  ): Promise<WebhookResult> {
+    const user = await manager.getRepository(User).findOne({
+      where: { address: payload.data.account },
+    });
 
-  /**
-   * Update user funding status
-   */
-  private async updateUserFundingStatus(
-    user: User,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _amount: string,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _transactionHash: string
-  ): Promise<User> {
+    // Unknown address: record nothing so a later redelivery (after the user
+    // exists) is still processed rather than treated as a duplicate.
+    if (!user) {
+      return { success: false, message: "User not found for this address" };
+    }
+
+    const isNewWebhook = await webhookIdempotencyService.recordInTransaction(
+      manager,
+      payload.id,
+      "stellar_funding",
+      {
+        transactionHash: payload.data.transaction_hash,
+        account: payload.data.account,
+      }
+    );
+
+    if (!isNewWebhook) {
+      return { success: true, message: "Webhook already processed (idempotent)" };
+    }
+
+    if (user.isFunded) {
+      return { success: true, message: "User already funded", userId: user.id };
+    }
+
     user.isFunded = true;
     user.updatedAt = new Date();
-    return await this.userRepository.save(user);
+    const updatedUser = await manager.getRepository(User).save(user);
+
+    await jobQueueService.enqueueWithContext(
+      {
+        queue: "side-effects",
+        jobType: "funding.auto_deploy",
+        userId: updatedUser.id,
+        correlationId: payload.data.transaction_hash,
+        maxAttempts: 5,
+        payload: {
+          userId: updatedUser.id,
+          transactionHash: payload.data.transaction_hash,
+          amount: payload.data.amount,
+          stellarAccount: payload.data.account,
+        },
+      },
+      manager
+    );
+
+    return {
+      success: true,
+      message: "Funding webhook processed successfully",
+      userId: updatedUser.id,
+      deploymentTriggered: true,
+    };
   }
 
   /**
@@ -231,75 +268,22 @@ export class StellarWebhookService {
 
       const payload: StellarWebhookPayload = rawBody;
 
-      // Check for idempotency
-      const isNewWebhook = await webhookIdempotencyService.checkAndMark(
-        payload.id,
-        "stellar_funding",
-        {
-          transactionHash: payload.data.transaction_hash,
-          account: payload.data.account,
-        },
+      // Dedup record, funding update, and the side-effect job commit in one
+      // transaction (#1065). A crash before commit leaves nothing behind, so a
+      // provider retry re-runs the whole handler; after commit, retries are
+      // recognised as duplicates and enqueue nothing.
+      const result = await AppDataSource.transaction((manager) =>
+        this.applyFundingWebhook(manager, payload)
       );
 
-      if (!isNewWebhook) {
-        return {
-          success: true,
-          message: "Webhook already processed (idempotent)",
-        };
-      }
-
-      // Find user by Stellar address
-      const user = await this.findUserByAddress(payload.data.account);
-
-      if (!user) {
-        return {
-          success: false,
-          message: "User not found for this address",
-        };
-      }
-
-      // Check if user is already funded
-      if (user.isFunded) {
-        return {
-          success: true,
-          message: "User already funded",
-          userId: user.id,
-        };
-      }
-
-      // Update user funding status
-      const updatedUser = await this.updateUserFundingStatus(
-        user,
-        payload.data.amount,
-        payload.data.transaction_hash
-      );
-
-      await jobQueueService.enqueueWithContext({
-        queue: "side-effects",
-        jobType: "funding.auto_deploy",
-        userId: updatedUser.id,
-        correlationId: payload.data.transaction_hash,
-        maxAttempts: 5,
-        payload: {
-          userId: updatedUser.id,
+      if (result.deploymentTriggered) {
+        logger.info("Queued funding auto-deployment", {
+          userId: result.userId,
+          webhookId: payload.id,
           transactionHash: payload.data.transaction_hash,
-          amount: payload.data.amount,
-          stellarAccount: payload.data.account,
-        },
-      });
-
-      logger.info("Queued funding auto-deployment", {
-        userId: updatedUser.id,
-        webhookId: payload.id,
-        transactionHash: payload.data.transaction_hash,
-      });
-
-      return {
-        success: true,
-        message: "Funding webhook processed successfully",
-        userId: updatedUser.id,
-        deploymentTriggered: true,
-      };
+        });
+      }
+      return result;
     } catch (error) {
       logger.error("Error processing funding webhook", {
         error: error instanceof Error ? error.message : String(error),
