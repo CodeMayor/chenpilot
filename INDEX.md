@@ -69,6 +69,7 @@ See detailed documentation:
 - [docs/AGENT_MEMORY_SEEDING.md](docs/AGENT_MEMORY_SEEDING.md) — Agent Memory Seeding Guide
 - [docs/AGENT_PLANNER_FAILURE_SEMANTICS.md](docs/AGENT_PLANNER_FAILURE_SEMANTICS.md) — AgentPlanner and PlanExecutor Failure Semantics
 - [docs/AGENT_PLAN_COST_MONITORING.md](docs/AGENT_PLAN_COST_MONITORING.md) — Agent plan token and cost monitoring
+- [docs/BOT_COMMAND_OUTPUT.md](docs/BOT_COMMAND_OUTPUT.md) — Bot Command Output and Selectors
 - [docs/BOT_IDENTITY_LINKING.md](docs/BOT_IDENTITY_LINKING.md) — Bot Identity Linking System
 - [docs/BRIDGE_ACCOUNTING_INTEGRATION_GUIDE.md](docs/BRIDGE_ACCOUNTING_INTEGRATION_GUIDE.md) — Bridge Accounting Integration Guide
 - [docs/CONTRACT_DEPLOYMENT_RUNBOOK.md](docs/CONTRACT_DEPLOYMENT_RUNBOOK.md) — Contract Deployment and Upgrade Runbook

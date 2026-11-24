@@ -1385,20 +1385,20 @@
     {
       "name": "MODERATION_LOG_CHANNEL_ID",
       "service": "bot",
-      "owner": "Bot (`packages/bot/src/discord`)",
+      "owner": "Bot (`packages/bot/src/adapters/discord.ts`, `packages/bot/src/discord`)",
       "required": false,
       "default": "DISCORD_AUDIT_LOG_CHANNEL_ID",
       "secret": false,
-      "description": "Discord moderation log channel."
+      "description": "Discord moderation log channel. Configure explicitly for private abuse-report delivery."
     },
     {
       "name": "MODERATION_LOG_CHAT_ID",
       "service": "bot",
-      "owner": "Bot (`packages/bot/src/commands/adapters`)",
+      "owner": "Bot (`packages/bot/src/adapters/telegram.ts`, `packages/bot/src/commands/adapters`)",
       "required": false,
       "default": null,
       "secret": false,
-      "description": "Telegram moderation log chat."
+      "description": "Telegram moderation log chat. Configure for private abuse-report delivery."
     },
     {
       "name": "MODERATION_ENABLED",
