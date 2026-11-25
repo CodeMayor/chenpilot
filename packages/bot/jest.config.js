@@ -1,20 +1,16 @@
-const path = require('path');
-
-const workspaceRoot = path.resolve(__dirname, '../..');
-
 module.exports = {
-  rootDir: workspaceRoot,
-  roots: ['<rootDir>/packages/bot/src'],
+  rootDir: __dirname,
+  roots: ['<rootDir>/src'],
   testEnvironment: 'node',
   testMatch: ['**/__tests__/**/*.test.ts', '**/*.test.ts'],
-  moduleDirectories: ['node_modules', 'packages/bot/node_modules'],
+  moduleDirectories: ['node_modules'],
   moduleFileExtensions: ['ts', 'js', 'json'],
   testTimeout: 10000,
   transform: {
     '^.+\\.ts$': [
-      require.resolve('ts-jest', { paths: [__dirname, workspaceRoot] }),
+      'ts-jest',
       {
-        tsconfig: '<rootDir>/packages/bot/tsconfig.json',
+        tsconfig: '<rootDir>/tsconfig.json',
         diagnostics: false,
       },
     ],
