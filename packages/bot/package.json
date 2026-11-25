@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "test": "jest --config jest.config.js --runInBand"
+    "test": "jest --config ../../jest.config.js --runInBand --runTestsByPath src/__tests__/abuseReport.test.ts src/__tests__/portfolioPagination.test.ts src/__tests__/swapWizard.test.ts src/__tests__/helpProvider.test.ts"
   },
   "dependencies": {
     "@chen-pilot/sdk-core": "*",
