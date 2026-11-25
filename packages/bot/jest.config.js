@@ -4,6 +4,7 @@ module.exports = {
   testEnvironment: 'node',
   testMatch: ['**/__tests__/**/*.test.ts', '**/*.test.ts'],
   moduleDirectories: ['node_modules'],
+  modulePaths: ['<rootDir>/../../node_modules'],
   moduleFileExtensions: ['ts', 'js', 'json'],
   testTimeout: 10000,
   transform: {
