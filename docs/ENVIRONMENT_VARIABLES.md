@@ -113,6 +113,7 @@ at the end of the table so reviewers can see them.
 | `INBOUND_JSON_LIMIT_BYTES` | Gateway (`src/config/config.ts`) | No | `1048576` | No | Maximum JSON request body size. |
 | `INBOUND_WEBHOOK_LIMIT_BYTES` | Gateway (`src/config/config.ts`) | No | `1048576` | No | Maximum webhook request body size. |
 | `INTERVENTION_SIGNING_SECRET` | Agents (`src/Agents/planner`) | No | — | Yes | HMAC secret for operator interventions. Interventions are disabled when unset. |
+| `JOB_SHUTDOWN_DEADLINE_MS` | Jobs (`src/jobs/jobWorker.ts`) | No | `25000` | No | Grace period for in-flight job handlers during shutdown, in milliseconds. |
 | `JWT_ACCESS_SECRET` | Auth (`src/Auth/jwt.service.ts`) | Yes | — | Yes | Signs access tokens. |
 | `JWT_REFRESH_SECRET` | Auth (`src/Auth/jwt.service.ts`) | Yes | — | Yes | Signs refresh tokens. |
 | `JWT_RESET_EXPIRY` | Auth (`src/config/config.ts`) | No | `1h` | No | Password reset token lifetime. |

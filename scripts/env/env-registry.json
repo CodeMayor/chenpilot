@@ -555,6 +555,15 @@
       "secret": false,
       "description": "Transcription endpoint."
     },
+    {
+      "name": "JOB_SHUTDOWN_DEADLINE_MS",
+      "service": "backend",
+      "owner": "Jobs (`src/jobs/jobWorker.ts`)",
+      "required": false,
+      "default": "25000",
+      "secret": false,
+      "description": "Grace period for in-flight job handlers during shutdown, in milliseconds."
+    },
 
     {
       "name": "JWT_SECRET",
