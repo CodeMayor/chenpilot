@@ -4,17 +4,10 @@ module.exports = {
   testEnvironment: 'node',
   testMatch: ['**/__tests__/**/*.test.ts', '**/*.test.ts'],
   moduleDirectories: ['node_modules'],
-  modulePaths: ['<rootDir>/../../node_modules'],
   moduleFileExtensions: ['ts', 'js', 'json'],
   testTimeout: 10000,
   transform: {
-    '^.+\\.ts$': [
-      'ts-jest',
-      {
-        tsconfig: '<rootDir>/tsconfig.json',
-        diagnostics: false,
-      },
-    ],
+    '^.+\\.ts$': '<rootDir>/jest.typescript-transformer.js',
   },
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
