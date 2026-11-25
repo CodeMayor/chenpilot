@@ -12,7 +12,7 @@ module.exports = {
   testTimeout: 10000,
   transform: {
     '^.+\\.ts$': [
-      'ts-jest',
+      require.resolve('ts-jest', { paths: [__dirname, workspaceRoot] }),
       {
         tsconfig: '<rootDir>/packages/bot/tsconfig.json',
         diagnostics: false,
