@@ -1,3 +1,5 @@
+const path = require('path');
+
 module.exports = {
   rootDir: __dirname,
   roots: ['<rootDir>/src'],
@@ -7,7 +9,7 @@ module.exports = {
   moduleFileExtensions: ['ts', 'js', 'json'],
   testTimeout: 10000,
   transform: {
-    '^.+\\.ts$': '<rootDir>/jest.typescript-transformer.js',
+    '^.+\\.ts$': path.resolve(__dirname, 'jest.typescript-transformer.js'),
   },
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
